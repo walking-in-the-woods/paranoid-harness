@@ -1,0 +1,16 @@
+.env
+.venv/
+workspace/*
+!workspace/.gitkeep
+logs/*
+!logs/.gitkeep
+ollama-models-verified.sha256
+site/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# uv.lock и pyproject.toml НЕ игнорируются — они должны коммититься
+# для воспроизводимости окружения.

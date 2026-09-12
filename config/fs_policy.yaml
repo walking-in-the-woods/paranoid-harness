@@ -1,0 +1,70 @@
+# Корневая разрешённая директория (внутри контейнера).
+root: /workspace
+
+# Белый список: файл должен матчиться ХОТЯ БЫ ОДНИМ из этих шаблонов.
+# Пустой список означает «ничего не разрешено» (не «всё разрешено»).
+# Отсутствие ключа — дефолт ["**"].
+whitelist:
+  - "**"
+
+# Чёрный список: применяется ПОСЛЕ белого. Пустой = ничего не запрещено.
+blacklist:
+  # VCS и секреты
+  - "**/.git/**"
+  - "**/.gitconfig"
+  - "**/.gitattributes"
+  - "**/.gitmodules"
+  - "**/.ssh/**"
+  - "**/.aws/**"
+  - "**/.kube/**"
+  - "**/.env"
+  - "**/.env.*"
+  - "**/*.key"
+  - "**/*.pem"
+  - "**/secrets/**"
+  - "**/id_rsa*"
+  - "**/id_ed25519*"
+
+  # Shell startup / persistence
+  - "**/.bashrc"
+  - "**/.bash_profile"
+  - "**/.bash_login"
+  - "**/.bash_logout"
+  - "**/.zshrc"
+  - "**/.zprofile"
+  - "**/.zlogin"
+  - "**/.profile"
+  - "**/.envrc"
+  - "**/.netrc"
+  - "**/.npmrc"
+  - "**/.pypirc"
+
+  # Сборочные и CI-файлы
+  - "**/Makefile"
+  - "**/makefile"
+  - "**/GNUmakefile"
+  - "**/Dockerfile*"
+  - "**/docker-compose*.yml"
+  - "**/docker-compose*.yaml"
+  - "**/package.json"
+  - "**/package-lock.json"
+  - "**/yarn.lock"
+  - "**/pnpm-lock.yaml"
+  - "**/setup.py"
+  - "**/setup.cfg"
+  - "**/pyproject.toml"
+  - "**/tox.ini"
+  - "**/.github/workflows/**"
+  - "**/.gitlab-ci.yml"
+  - "**/.circleci/**"
+  - "**/.pre-commit-config.yaml"
+
+# Список путей, РАЗРЕШЁННЫХ ДЛЯ ЗАПИСИ.
+# Пустой список = запись везде запрещена.
+writable:
+  - "notes/**"
+  - "output/**"
+  - "drafts/**"
+  - "docs/**"
+  - "*.md"
+  - "*.txt"

@@ -1,0 +1,117 @@
+# Формат Compose v2 (без поля `version:`).
+#
+# Ключи `mem_limit` и `cpus` — из Compose v2, работают в docker compose
+# v2 binary. В устаревшей схеме v3 они не поддерживались; здесь не
+# используется `deploy.resources`, чтобы не тянуть swarm-синтаксис.
+
+services:
+
+  ollama-runner:
+    image: ollama/ollama:latest
+    container_name: ollama-runner
+    networks: [internal-net]
+    volumes:
+      - ollama-models-verified:/root/.ollama
+    tmpfs:
+      - /tmp:size=1g
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 8g
+    cpus: 4.0
+    restart: unless-stopped
+    # Без read_only: true — Ollama может писать в /root/.cache,
+    # /root/.config и другие пути вне /root/.ollama. Оставлено
+    # writable для совместимости. Для paranoid-режима см.
+    # docs/security-model.md, раздел «Что сделать при чувствительных
+    # данных» — там описано, как включить read_only и какие пути
+    # смонтировать как tmpfs.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  ollama-updater:
+    image: ollama/ollama:latest
+    container_name: ollama-updater
+    networks: [external-net]
+    volumes:
+      - ollama-models-staging:/root/.ollama
+    read_only: true
+    tmpfs:
+      - /tmp:size=2g
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 4g
+    cpus: 2.0
+    profiles: ["updater"]
+
+  api-proxy:
+    build: ./api_proxy
+    container_name: api-proxy
+    networks:
+      - internal-net
+      - external-net
+    environment:
+      - PROXY_SECRET=${PROXY_SECRET:?PROXY_SECRET must be set (see .env.example)}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  harness:
+    build: ./harness
+    container_name: harness
+    networks: [internal-net]
+    volumes:
+      - ./workspace:/workspace:rw
+      - ./config:/config:ro
+      - ./logs:/logs:rw
+    environment:
+      - OLLAMA_HOST=http://ollama-runner:11434
+      - HARNESS_MODEL=${HARNESS_MODEL:-qwen3:8b}
+      - WORKSPACE_DIR=/workspace
+      - CONFIG_DIR=/config
+      - API_PROXY_URL=http://api-proxy:8080
+      - PROXY_SECRET=${PROXY_SECRET:?}
+      - AUDIT_PATH=/logs/audit.jsonl
+      - HOME=/tmp
+      - PYTHONDONTWRITEBYTECODE=1
+    user: "${UID:-1000}:${GID:-1000}"
+    depends_on:
+      ollama-runner:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    stdin_open: true
+    tty: true
+
+networks:
+  internal-net:
+    internal: true
+  external-net:
+    driver: bridge
+
+volumes:
+  ollama-models-verified:
+  ollama-models-staging:

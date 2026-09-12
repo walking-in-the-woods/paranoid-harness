@@ -1,0 +1,22 @@
+# Logrotate для audit.jsonl.
+#
+# Установка:
+#   sudo cp config/logrotate.harness /etc/logrotate.d/harness
+#   # Замените @PROJECT_PATH@, @UID@, @GID@ на реальные значения.
+#   sudo nano /etc/logrotate.d/harness
+#   sudo logrotate -d /etc/logrotate.d/harness   # проверка
+#
+# Или запустите вручную из harness-project:
+#   sed "s|@PROJECT_PATH@|$(pwd)|; s|@UID@|$(id -u)|; s|@GID@|$(id -g)|" \
+#     config/logrotate.harness | sudo tee /etc/logrotate.d/harness
+
+@PROJECT_PATH@/logs/audit.jsonl {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0644 @UID@ @GID@
+}
