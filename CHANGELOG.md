@@ -34,6 +34,15 @@
   безопаснее under-aggressive. Тесты:
   `test_neutralize_does_not_overreach_html_tags` и
   `test_neutralize_still_covers_tool_call_variants`.
+- **`_tool_list_dir`: формат вывода.** Литерал `'DIR '` с завершающим
+  пробелом давал два пробела для директорий (`DIR  docs`) и один для
+  файлов (`FILE readme.md`). Асимметрия ломала точное сравнение в
+  тестах и снижала читаемость tool_result для модели. Убран
+  завершающий пробел. Тесты, зависевшие от старого формата,
+  актуализированы: `test_list_dir_basic` разделён на два листинга
+  (`list_dir` нерекурсивный), `test_read_file_written_in_session_blocked`
+  теперь создаёт файл перед `mark_written` (в реальном потоке файл
+  гарантированно создан после `[OK]` от `ConfirmSession.apply`).
 - **Read-after-write: end-to-end тест.** Предыдущие тесты проверяли
   канонизацию в изоляции (вручную вызывали `mark_written(canonical)`).
   Добавлены `test_read_after_write_end_to_end` и

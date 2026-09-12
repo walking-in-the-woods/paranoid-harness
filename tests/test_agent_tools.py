@@ -173,6 +173,11 @@ def test_canonical_rel_denied_returns_empty(agent: HarnessAgent):
 # --------------------------------------------------------------------------
 
 def test_read_file_written_in_session_blocked(agent: HarnessAgent):
+    # В реальном потоке mark_written вызывается только после [OK] от
+    # ConfirmSession.apply — файл гарантированно создан. Создаём его
+    # и здесь, чтобы _tool_read_file дошёл до проверки _written_paths
+    # (проверка is_file() идёт раньше).
+    (agent.workspace / "notes" / "a.md").write_text("payload", encoding="utf-8")
     agent.mark_written("notes/a.md")
     out = agent._tool_read_file("notes/a.md")
     assert out.startswith("ACCESS DENIED")
@@ -306,8 +311,16 @@ def test_read_file_source_uses_canonical(agent: HarnessAgent):
 # --------------------------------------------------------------------------
 
 def test_list_dir_basic(agent: HarnessAgent):
+    # list_dir нерекурсивный: возвращает только прямых детей каталога.
+    # В корне workspace — каталоги docs/, notes/, output/ и скрытый .git/.
     out = agent._tool_list_dir(".")
     assert "DIR docs" in out
+    assert "DIR notes" in out
+    assert "DIR output" in out
+
+    # Файл docs/readme.md лежит внутри docs/, а не в корне.
+    # Проверяем отдельным вызовом для docs/.
+    out = agent._tool_list_dir("docs")
     assert "FILE docs/readme.md" in out
 
 

@@ -370,7 +370,10 @@ class HarnessAgent:
         hit_limit = next(it, None) is not None
 
         candidates.sort()
-        lines = [f"{'DIR ' if is_dir else 'FILE'} {rel_}"
+        # Формат: "DIR <path>" или "FILE <path>" — ровно один пробел
+        # между типом и путём. Раньше литерал был 'DIR ' с завершающим
+        # пробелом, что давало два пробела и ломало точное сравнение.
+        lines = [f"{'DIR' if is_dir else 'FILE'} {rel_}"
                  for rel_, is_dir in candidates]
 
         truncated = hit_limit or len(lines) > MAX_LIST_ENTRIES
