@@ -1,12 +1,8 @@
 # Установка Local AI Harness на Windows через WSL2
 
 От нуля до работающего харнесса на Windows 11 (или 10 с обновлениями).
-Четыре шага, три скрипта — те же, что в Linux-инструкции, с
-поправками на специфику WSL.
 
-**Вне этого документа** — текст `setup.sh` (~2900 строк), создающий
-файлы проекта. Он универсален для Linux и WSL. Здесь описано, куда
-его положить и что с ним делать.
+**Репозиторий:** <https://github.com/walking-in-the-woods/paranoid-harness>
 
 ---
 
@@ -42,25 +38,23 @@
 
 1. **Проект должен жить в Linux-разделе WSL, не на `/mnt/c/`.**
    Доступ к файлам на Windows-диске из WSL замедляется в 10 и более
-   раз. Клонируйте в `~/harness-project/`.
+   раз. Клонируйте в `~/paranoid-harness/`.
 
-2. **Сверьте хеш `setup.sh`** перед запуском. Ожидаемый хеш этой
-   версии публикуется рядом со скриптом. Если не совпал — не
-   запускайте.
-
-3. **Не удаляйте `[tool.uv] exclude-newer`** из `pyproject.toml`.
+2. **Не удаляйте `[tool.uv] exclude-newer`** из `pyproject.toml`.
    Это cooldown 7 дней — защита от свежих вредоносных релизов PyPI.
 
-4. **Добавьте `metadata` в `/etc/wsl.conf`** — иначе файлы на
+3. **Добавьте `metadata` в `/etc/wsl.conf`** — иначе файлы на
    `/mnt/c` будут иметь права `777` и часть проверок `fs_guard`
    может работать неожиданно.
 
-5. **MinGW не нужен.** Все скрипты работают в WSL, где уже есть
+4. **MinGW не нужен.** Все скрипты работают в WSL, где уже есть
    `bash`, `sed`, `tar`, `openssl`, `sha256sum`, `curl`.
 
-6. **Опционально: автоматическая сверка sha256 `setup.sh`.**
-   Запустите `./bootstrap.sh --verify-sha256=<хеш>` — при
-   несовпадении скрипт упадёт.
+5. **Опционально: автоматическая сверка sha256 `setup.sh`.** Если
+   вы разворачиваете проект из репозитория (`git clone`) — эта
+   проверка не нужна, целостность обеспечивается подписью коммитов
+   и HTTPS/TLS GitHub. Если скачали `setup.sh` отдельно — запустите
+   `./bootstrap.sh --verify-sha256=<хеш>`.
 
 ---
 
@@ -187,47 +181,46 @@ uv --version
 
 ---
 
-## Шаг 2. Создание файлов проекта
+## Шаг 2. Клонирование репозитория
 
-Скачайте `setup.sh` из отдельного документа и **сверьте хеш**:
-
-```bash
-sha256sum setup.sh
-# Сравните вывод с хешем из раздела «Прочитайте до старта».
-```
-
-**Куда положить `setup.sh`.** По умолчанию скрипт создаёт проект в
-текущей директории. Рекомендуемое место — домашний каталог WSL:
+**Куда клонировать.** По умолчанию — домашний каталог WSL:
 
 ```bash
 cd ~
-chmod +x setup.sh
-./setup.sh                    # создаст ~/harness-project
-cd ~/harness-project
+git clone https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
 ```
 
-**Не запускайте `setup.sh` из `/mnt/c/Users/...`** — проект окажется
-на Windows-диске, и производительность операций с файлами упадёт в
+Если хотите зафиксировать конкретную версию:
+
+```bash
+git clone --branch v0.10 --depth 1 \
+  https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
+```
+
+**Не клонируйте в `/mnt/c/Users/...`** — проект окажется на
+Windows-диске, и производительность операций с файлами упадёт в
 разы. Если вы уже развернули проект на `/mnt/c/`, перенесите его:
 
 ```bash
-cp -r /mnt/c/путь/к/harness-project ~/
-cd ~/harness-project
+cp -r /mnt/c/путь/к/paranoid-harness ~/
+cd ~/paranoid-harness
 ```
 
-`setup.sh` создаёт дерево и все файлы проекта. **Сетевых вызовов не
-делает** — только пишет на диск.
+**Альтернатива — `setup.sh`.** Если у вас нет доступа к GitHub или
+нужно развернуть проект без сети, можно использовать `setup.sh` из
+раздела релиза. Он создаёт те же файлы через heredoc'и.
 
 ---
 
 ## Шаг 3. Bootstrap
 
-Скрипт `bootstrap.sh` из Linux-инструкции полностью рабочий в WSL.
-Сохраните его внутри `~/harness-project/`, сделайте исполняемым,
-запустите:
+Скрипт `bootstrap.sh` из репозитория полностью рабочий в WSL.
+Запустите:
 
 ```bash
-cd ~/harness-project
+cd ~/paranoid-harness
 cp scripts/bootstrap.sh .
 chmod +x bootstrap.sh
 ./bootstrap.sh
@@ -236,6 +229,7 @@ chmod +x bootstrap.sh
 **Что делает bootstrap в WSL** (то же, что в Linux):
 
 1. Проверяет `setup.sh` (`bash -n` + grep по опасным конструкциям).
+   Для `git clone` этот шаг пропускается — файла `../setup.sh` нет.
 2. Создаёт `.env`: генерирует `PROXY_SECRET`, подставляет реальные
    `UID`/`GID`.
 3. Единоразово переходит на `uv.lock` с cooldown 7 дней.
@@ -310,7 +304,7 @@ docker inspect --format='{{index .RepoDigests 0}}' alpine:3.19
 
 | Место | Скорость | Когда использовать |
 |---|---|---|
-| `~/harness-project` (Linux-раздел) | Быстро | **Всегда, по умолчанию** |
+| `~/paranoid-harness` (Linux-раздел) | Быстро | **Всегда, по умолчанию** |
 | `/mnt/c/...` (Windows-раздел) | Медленно, в 10+ раз | Никогда для этого проекта |
 
 WSL2 использует файловый трансляционный слой для доступа к
@@ -331,14 +325,14 @@ Linux-разделе.
 Скопируйте файл в `workspace/input/` на Linux-разделе:
 
 ```bash
-cp /mnt/c/Users/ВашеИмя/Documents/report.md ~/harness-project/workspace/input/
+cp /mnt/c/Users/ВашеИмя/Documents/report.md ~/paranoid-harness/workspace/input/
 ```
 
 Результат, который модель запишет в `workspace/output/`, потом
 скопируйте обратно:
 
 ```bash
-cp ~/harness-project/workspace/output/summary.md /mnt/c/Users/ВашеИмя/Documents/
+cp ~/paranoid-harness/workspace/output/summary.md /mnt/c/Users/ВашеИмя/Documents/
 ```
 
 **Не запускайте модель на файлах с `/mnt/c` напрямую.** Работайте
@@ -428,13 +422,13 @@ Windows-терминала, Git Bash (поставляется с Git for Window
 Чтобы открыть папку `workspace/` в Проводнике:
 
 ```
-\\wsl$\Ubuntu\home\<пользователь>\harness-project\workspace
+\\wsl$\Ubuntu\home\<пользователь>\paranoid-harness\workspace
 ```
 
 Или в PowerShell:
 
 ```powershell
-explorer.exe "\\wsl$\Ubuntu\home\$env:USERNAME\harness-project\workspace"
+explorer.exe "\\wsl$\Ubuntu\home\$env:USERNAME\paranoid-harness\workspace"
 ```
 
 Отсюда можно копировать файлы в `input/` и забирать из `output/`
@@ -464,7 +458,7 @@ echo "$USER ALL=(ALL:ALL) NOPASSWD: ALL" | \
 Готовый шаблон лежит в `config/logrotate.harness`. Установка:
 
 ```bash
-cd ~/harness-project
+cd ~/paranoid-harness
 sed "s|@PROJECT_PATH@|$(pwd)|; s|@UID@|$(id -u)|; s|@GID@|$(id -g)|" \
   config/logrotate.harness | sudo tee /etc/logrotate.d/harness
 
@@ -475,7 +469,7 @@ sudo logrotate -d /etc/logrotate.d/harness
 
 ---
 
-## Проверка целостности setup.sh
+## Проверка целостности setup.sh (только для пути через setup.sh)
 
 `bootstrap.sh` **не сверяет** sha256 `setup.sh` автоматически по
 умолчанию. Сверка хеша — ваша ответственность:
@@ -545,15 +539,15 @@ sha256sum setup.sh
 #    - установка Docker Desktop с WSL Integration
 #    - установка uv в WSL
 
-# 2. Создание файлов проекта
+# 2. Клонирование репозитория
 cd ~
-sha256sum setup.sh                    # сверьте с ожидаемым
-./setup.sh && cd harness-project
+git clone https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
 
 # 3. Bootstrap
 cp scripts/bootstrap.sh .
 chmod +x bootstrap.sh
-./bootstrap.sh --verify-sha256=<хеш>   # или без флага
+./bootstrap.sh
 
 # 4. Работа
 docker compose exec harness python -m harness.main

@@ -12,6 +12,23 @@
 | v0.8 | Security fixes after audit |
 | v0.9 | Audit round 2 fixes |
 | v0.10 | Audit round 3 fixes |
+| v0.11 | Switch to GitHub repository |
+
+## v0.11 — Switch to GitHub repository
+
+### Changed
+- **Инструкции по установке** переведены с `setup.sh` на `git clone`
+  из <https://github.com/walking-in-the-woods/paranoid-harness>.
+  `setup.sh` остаётся в репозитории как вспомогательный инструмент
+  для генерации структуры без сети, но документация на него больше
+  не опирается.
+- `README.md`: добавлена ссылка на репозиторий и раздел «Быстрый
+  старт» с `git clone`.
+- `INSTALL-LINUX.md`: шаг 2 «Создание файлов проекта» заменён на
+  «Клонирование репозитория». Разделы про `--verify-sha256` и
+  sha256 `setup.sh` сохранены с пометкой «только для пути через
+  setup.sh».
+- `INSTALL-WINDOWS.md`: аналогичные изменения.
 
 ## v0.10 — Audit round 3 fixes
 

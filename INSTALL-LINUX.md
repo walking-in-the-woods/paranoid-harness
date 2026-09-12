@@ -1,11 +1,9 @@
 # Установка Local AI Harness на Linux
 
-От нуля до работающего харнесса. Четыре шага, три скрипта, никаких
-ручных правок конфигов.
+От нуля до работающего харнесса. Четыре шага, никаких ручных правок
+конфигов.
 
-**Вне этого документа** — текст `setup.sh`, создающий файлы проекта.
-Публикуется отдельно; здесь описано, куда его положить и что с ним
-делать.
+**Репозиторий:** <https://github.com/walking-in-the-woods/paranoid-harness>
 
 ---
 
@@ -48,20 +46,19 @@
    базовых образов (раздел A) **до первого запуска**. Для локального
    эксперимента можно пропустить.
 
-2. **Сверьте хеш `setup.sh`** перед запуском. Ожидаемый хеш этой
-   версии публикуется рядом со скриптом. Если не совпал — не
-   запускайте.
-
-3. **Не удаляйте `[tool.uv] exclude-newer`** из `pyproject.toml`.
+2. **Не удаляйте `[tool.uv] exclude-newer`** из `pyproject.toml`.
    Это cooldown 7 дней — защита от свежих вредоносных релизов PyPI.
 
-4. **Не добавляйтесь в группу `docker`.** Все команды идут через
+3. **Не добавляйтесь в группу `docker`.** Все команды идут через
    `sudo docker`. Членство в группе эквивалентно root-доступу на
    хосте.
 
-5. **Опционально: автоматическая сверка sha256 `setup.sh`.**
-   Запустите `./bootstrap.sh --verify-sha256=<хеш>` — при
-   несовпадении скрипт упадёт. Это надёжнее, чем ручная сверка.
+4. **Опционально: автоматическая сверка sha256 `setup.sh`.** Если
+   вы разворачиваете проект из репозитория (`git clone`) — эта
+   проверка не нужна, целостность обеспечивается подписью коммитов
+   и HTTPS/TLS GitHub. Если скачали `setup.sh` отдельно как
+   самостоятельный артефакт — запустите `./bootstrap.sh
+   --verify-sha256=<хеш>`, при несовпадении скрипт упадёт.
 
 ---
 
@@ -100,25 +97,29 @@ source ~/.bashrc
 
 ---
 
-## Шаг 2. Создание файлов проекта
-
-Возьмите `setup.sh` из отдельного документа. **Сверьте хеш**:
+## Шаг 2. Клонирование репозитория
 
 ```bash
-sha256sum setup.sh
-# Сравните вывод с ожидаемым хешем из документации к релизу.
-# Только если совпал:
-./setup.sh
-cd harness-project
+git clone https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
 ```
 
-`setup.sh` создаёт дерево и все файлы проекта. **Сетевых вызовов не
-делает** — только пишет на диск.
+Если хотите зафиксировать конкретную версию:
 
-**Что создаётся:** см. заголовок `setup.sh` — там полное дерево с
-описанием каждого файла.
+```bash
+git clone --branch v0.10 --depth 1 \
+  https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
+```
 
-**Проверка перед запуском** (если получили скрипт не от себя):
+Что создаётся в директории — см. дерево проекта в README репозитория.
+
+**Альтернатива — `setup.sh`.** Если у вас нет доступа к GitHub или
+нужно развернуть проект без сети, можно использовать `setup.sh` из
+раздела релиза. Он создаёт те же файлы через heredoc'и. Хеш для
+проверки — в разделе релиза.
+
+**Проверка перед запуском** (только для пути через `setup.sh`):
 
 ```bash
 bash -n setup.sh                                              # синтаксис
@@ -131,12 +132,7 @@ grep -nE '(curl|wget|nc |/dev/tcp|eval|base64 -d)' setup.sh   # потенциа
 
 ## Шаг 3. Bootstrap проекта
 
-Скопируйте `scripts/bootstrap.sh` внутрь `harness-project/` (или
-запускайте из родительской директории — скрипт сам находит `.env`).
-Запустите:
-
 ```bash
-cd harness-project
 cp scripts/bootstrap.sh .
 chmod +x bootstrap.sh
 ./bootstrap.sh
@@ -147,7 +143,8 @@ chmod +x bootstrap.sh
 1. Проверяет `../setup.sh` (если найден): `bash -n` + grep по
    опасным конструкциям (`curl`, `wget`, `nc`, `/dev/tcp`, `eval`,
    `base64 -d`, `rm -rf`, `dd if=`, `mkfs`). Опционально — sha256-сверка
-   через `--verify-sha256=<hash>`.
+   через `--verify-sha256=<hash>`. Для `git clone` этот шаг
+   пропускается — файла `../setup.sh` нет.
 2. Создаёт `.env`: генерирует `PROXY_SECRET`, подставляет реальные
    `UID`/`GID`.
 3. Единоразово переходит на `uv.lock` с **cooldown 7 дней**
@@ -185,8 +182,8 @@ sudo docker compose exec harness python -m harness.main
 При предложении записи харнесс покажет diff и одноразовый
 6-символьный код. Файл создаётся только при точном вводе кода.
 
-**Куда класть файлы:** `harness-project/workspace/input/` — ваши
-исходники; результат — в `harness-project/workspace/output/`. См.
+**Куда класть файлы:** `paranoid-harness/workspace/input/` — ваши
+исходники; результат — в `paranoid-harness/workspace/output/`. См.
 `docs/usage.md`.
 
 ---
@@ -342,7 +339,7 @@ sudo docker compose exec ollama-runner ollama list
 Готовый шаблон лежит в `config/logrotate.harness`. Установка:
 
 ```bash
-cd harness-project
+cd paranoid-harness
 sed "s|@PROJECT_PATH@|$(pwd)|; s|@UID@|$(id -u)|; s|@GID@|$(id -g)|" \
   config/logrotate.harness | sudo tee /etc/logrotate.d/harness
 
@@ -354,7 +351,7 @@ sudo logrotate -d /etc/logrotate.d/harness
 
 ---
 
-## Проверка целостности setup.sh
+## Проверка целостности setup.sh (только для пути через setup.sh)
 
 `bootstrap.sh` **не сверяет** sha256 `setup.sh` автоматически по
 умолчанию. Сверка хеша — ваша ответственность:
@@ -429,14 +426,14 @@ sha256sum setup.sh
 chmod +x install-machine.sh && ./install-machine.sh
 source ~/.bashrc
 
-# 2. Файлы проекта (сверьте хеш setup.sh)
-sha256sum setup.sh                    # сравните с ожидаемым вручную
-./setup.sh && cd harness-project
+# 2. Клонирование репозитория
+git clone https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
 
-# 3. Bootstrap (опционально с автопроверкой хеша)
+# 3. Bootstrap
 cp scripts/bootstrap.sh .
 chmod +x bootstrap.sh
-./bootstrap.sh --verify-sha256=<ожидаемый-хеш>   # или без флага
+./bootstrap.sh
 
 # 4. Работа
 sudo docker compose exec harness python -m harness.main
