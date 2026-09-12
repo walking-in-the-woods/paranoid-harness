@@ -16,6 +16,18 @@
 ## v0.10 — Audit round 3 fixes
 
 ### Fixed
+- **Smoke-тесты: thinking mode qwen3.** `test_sentinel_pong` и
+  `test_json_mode_structured` падали с `AssertionError: empty response`
+  на `qwen3:0.6b`. Причина — Qwen3 в Ollama по умолчанию генерирует
+  сначала внутренний thinking-блок, и только потом `message.content`.
+  При малом `num_predict` (32 для sentinel, 128 для json-mode) модель
+  не успевает выйти из reasoning, `content` остаётся пустым.
+  `test_who_are_you_ascii` проходил случайно — 128 токенов едва
+  хватало, тест был флаки. Во все три теста добавлен параметр
+  `think=False` (Ollama отключает reasoning-фазу, модель сразу
+  отвечает в `content`). `test_who_are_you_ascii` тоже — устраняем
+  флакость. `harness/requirements.txt`: `ollama>=0.4.4` →
+  `ollama>=0.4.8` — параметр `think` появился именно в 0.4.8.
 - **Формулировка про GPG fingerprint.** Предыдущее объяснение было
   инвертировано: GnuPG `--with-fingerprint` печатает fingerprint
   именно с декоративным двойным пробелом между 4-й и 5-й группами,

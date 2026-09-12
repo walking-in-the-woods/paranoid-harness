@@ -3,6 +3,13 @@
 Модели читаются из окружения:
   SMOKE_MODEL_SMALL — для базовых тестов (sentinel/JSON/ASCII).
   По умолчанию — qwen3:0.6b.
+
+Везде передаётся think=False: Qwen3 в Ollama по умолчанию генерирует
+внутренний thinking-блок до финального message.content. При малом
+num_predict модель не успевает выйти из reasoning и content остаётся
+пустым. Эти тесты проверяют детерминированный вывод, а не качество
+рассуждений — thinking отключаем. Для моделей без thinking-фазы
+параметр игнорируется.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ def test_sentinel_pong(client: ollama.Client):
             "role": "user",
             "content": "Reply with exactly one word: PONG",
         }],
+        think=False,     # Qwen3: без reasoning-фазы, content не пуст
         options={"temperature": 0.0, "num_predict": 32},
     )
     text = (resp["message"]["content"] or "").strip()
@@ -69,6 +77,7 @@ def test_json_mode_structured(client: ollama.Client):
             ),
         }],
         format="json",
+        think=False,     # reasoning-фаза мешает структурному выводу
         options={"temperature": 0.0, "num_predict": 128},
     )
     text = (resp["message"]["content"] or "").strip()
@@ -92,6 +101,7 @@ def test_who_are_you_ascii(client: ollama.Client):
             {"role": "system", "content": "You must answer in English only."},
             {"role": "user", "content": "Who are you?"},
         ],
+        think=False,     # устраняем флакость: без reasoning всегда есть content
         options={"temperature": 0.0, "num_predict": 128},
     )
     text = (resp["message"]["content"] or "").strip()
