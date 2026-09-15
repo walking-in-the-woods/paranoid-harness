@@ -27,7 +27,8 @@
 - Одна запись на сессию, с подтверждением одноразовым кодом.
 - Единственный сетевой канал модели — `api_call` через локальный
   прокси с whitelist'ом.
-- Audit-лог в `logs/audit.jsonl`.
+- mTLS-гейтвей к модели: клиентский сертификат + токен.
+- Audit-логи в `logs/audit.jsonl` и `logs/gateway.jsonl`.
 - Цепочка поставки: `uv` — версия + SHA256, Python — `uv.lock` +
   cooldown, базовые образы — опционально digest, модели —
   sha256-манифест.
@@ -54,7 +55,10 @@
    вы разворачиваете проект из репозитория (`git clone`) — эта
    проверка не нужна, целостность обеспечивается подписью коммитов
    и HTTPS/TLS GitHub. Если скачали `setup.sh` отдельно — запустите
-   `./bootstrap.sh --verify-sha256=<хеш>`.
+   `./scripts/bootstrap.sh --verify-sha256=<хеш>`.
+
+6. **`certs/ca.key`** после первого запуска перенесите в
+   offline-хранилище.
 
 ---
 
@@ -194,7 +198,7 @@ cd paranoid-harness
 Если хотите зафиксировать конкретную версию:
 
 ```bash
-git clone --branch v0.10 --depth 1 \
+git clone --branch v0.13 --depth 1 \
   https://github.com/walking-in-the-woods/paranoid-harness.git
 cd paranoid-harness
 ```
@@ -221,23 +225,28 @@ cd ~/paranoid-harness
 
 ```bash
 cd ~/paranoid-harness
-cp scripts/bootstrap.sh .
-chmod +x bootstrap.sh
-./bootstrap.sh
+chmod +x scripts/bootstrap.sh
+./scripts/bootstrap.sh
 ```
 
 **Что делает bootstrap в WSL** (то же, что в Linux):
 
 1. Проверяет `setup.sh` (`bash -n` + grep по опасным конструкциям).
    Для `git clone` этот шаг пропускается — файла `../setup.sh` нет.
-2. Создаёт `.env`: генерирует `PROXY_SECRET`, подставляет реальные
-   `UID`/`GID`.
+2. Создаёт `.env` из `.env.example`: генерирует `PROXY_SECRET`,
+   `GATEWAY_HMAC_KEY`, подставляет реальные `UID`/`GID`.
 3. Единоразово переходит на `uv.lock` с cooldown 7 дней.
 4. Прогоняет юнит-тесты.
-5. Собирает Docker-образы.
-6. Скачивает модель через изолированный `ollama-updater`, снимает
+5. Генерирует сертификаты mTLS в `./certs/` через
+   `scripts/gateway-certs.sh`.
+6. Генерирует токены клиентов гейтвея: токены в `.env`,
+   SHA256-хеши в `config/gateway_clients.yaml`.
+7. Собирает Docker-образы.
+8. Скачивает модель через изолированный `ollama-updater`, снимает
    снапшот, считает SHA256, промоутит в volume раннера.
-7. Поднимает `ollama-runner`, `api-proxy`, `harness`.
+9. Поднимает все сервисы: `ollama-runner`, `model-gateway`,
+   `gateway-tls`, `api-proxy`, `harness`.
+10. Fail-closed проверка плейсхолдеров в `.env` и YAML.
 
 **Отличие от Linux.** В bootstrap есть строка:
 
@@ -281,19 +290,21 @@ docker compose exec harness python -m harness.main
 docker pull ollama/ollama:latest
 docker inspect --format='{{index .RepoDigests 0}}' ollama/ollama:latest
 
-docker pull python:3.12-slim
-docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
+docker pull python:3.12.7-slim
+docker inspect --format='{{index .RepoDigests 0}}' python:3.12.7-slim
 
-docker pull alpine:3.19
-docker inspect --format='{{index .RepoDigests 0}}' alpine:3.19
+docker pull nginx:1.27.2-alpine
+docker inspect --format='{{index .RepoDigests 0}}' nginx:1.27.2-alpine
 ```
 
-Заменить:
+Заменить в Dockerfiles, либо автоматически:
+`bash scripts/pin-images.sh --update`.
 
-- `docker-compose.yml` — оба `ollama/ollama:latest` →
+- `docker-compose.yml` — `${OLLAMA_IMAGE}` в `.env` →
   `ollama/ollama@sha256:<digest>`.
-- `harness/Dockerfile`, `api_proxy/Dockerfile` —
-  `FROM python:3.12-slim` → `FROM python:3.12-slim@sha256:<digest>`.
+- `model_gateway/Dockerfile`, `harness/Dockerfile`,
+  `api_proxy/Dockerfile` — `FROM python:3.12.7-slim@sha256:<digest>`.
+- `gateway_tls/Dockerfile` — `FROM nginx:1.27.2-alpine@sha256:<digest>`.
 - Для `sync-model.sh` — задайте `ALPINE_IMAGE=alpine@sha256:<digest>`.
 
 ---
@@ -453,7 +464,7 @@ echo "$USER ALL=(ALL:ALL) NOPASSWD: ALL" | \
 
 ---
 
-## Раздел F. Logrotate для `audit.jsonl`
+## Раздел F. Logrotate для `audit.jsonl` и `gateway.jsonl`
 
 Готовый шаблон лежит в `config/logrotate.harness`. Установка:
 
@@ -482,7 +493,7 @@ sha256sum setup.sh
 **Опциональная автоматическая проверка:**
 
 ```bash
-./bootstrap.sh --verify-sha256=<ожидаемый-хеш>
+./scripts/bootstrap.sh --verify-sha256=<ожидаемый-хеш>
 ```
 
 **Формат хеша:** 64 hex-символа в нижнем регистре, без префикса
@@ -502,11 +513,13 @@ sha256sum setup.sh
 | Файлы на `/mnt/c` имеют права `777` | Добавьте `metadata` в `automount options` в `/etc/wsl.conf` |
 | Медленная работа `list_dir` | Проект лежит на `/mnt/c`. Перенесите в `~/` |
 | Не освобождается место на диске C: | См. раздел C (очистка) |
-| `model not found` | `./scripts/sync-model.sh qwen3:8b` |
+| `model not found` | `bash scripts/sync-model.sh qwen3:8b` |
 | `502 upstream error` при `api_call` | Публичный API недоступен — не ваша сеть |
 | Модель не вызывает инструменты | Нужна `qwen3 ≥1.7b`, `llama3.1`, `mistral-nemo` |
 | `bash: ./setup.sh: /bin/bash^M: bad interpreter` | Файл скачан с Windows-переносами строк. `sed -i 's/\r$//' setup.sh` |
 | `python3 не найден, но задан HARNESS_MODEL_DIGEST` | `sudo apt install -y python3` или очистите `HARNESS_MODEL_DIGEST` |
+| `[!] Не найден обязательный файл: X` | Повреждённый клон. Проверьте `git status`, `ls` |
+| `[!] В .env остались плейсхолдеры` | Проверьте `CLIENTS=()` в bootstrap и `name:` в YAML |
 
 ---
 
@@ -519,10 +532,10 @@ sha256sum setup.sh
   `$HOME`.
 - **Запись — только с вашего подтверждения:** одна на сессию, с
   diff и одноразовым кодом.
+- **mTLS-гейтвей:** клиентский сертификат + токен.
 - **Скрипты читаемы:** `install-machine.sh` — два `curl` (Docker GPG,
   uv release) с проверкой SHA256 и fingerprint. `setup.sh` — без
-  сетевых вызовов. `bootstrap.sh` проверяет `setup.sh` и содержит
-  пояснение про ложные срабатывания grep.
+  сетевых вызовов. `bootstrap.sh` проверяет `setup.sh`.
 - **Цепочка поставки закрыта:** `uv` — версия + SHA256; PyPI —
   `uv.lock` + cooldown 7 дней; образы — опционально digest; модели —
   sha256-манифест; `.env` — в `.gitignore`.
@@ -545,9 +558,8 @@ git clone https://github.com/walking-in-the-woods/paranoid-harness.git
 cd paranoid-harness
 
 # 3. Bootstrap
-cp scripts/bootstrap.sh .
-chmod +x bootstrap.sh
-./bootstrap.sh
+chmod +x scripts/bootstrap.sh
+./scripts/bootstrap.sh
 
 # 4. Работа
 docker compose exec harness python -m harness.main

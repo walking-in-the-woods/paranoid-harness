@@ -21,7 +21,7 @@ sudo docker inspect --format='{{.State.Health.Status}}' ollama-runner
 
 | Причина | Решение |
 |---|---|
-| Модель не загружена | `./scripts/sync-model.sh qwen3:8b` |
+| Модель не загружена | `bash scripts/sync-model.sh qwen3:8b` |
 | `HARNESS_MODEL` в `.env` не совпадает с загруженной | Поправить `.env`, перезапустить `harness` |
 | Модель не влезает в RAM | Уменьшить размер: `qwen3:1.7b` вместо `qwen3:8b` |
 | `ollama-runner` не стартовал | `sudo docker compose logs ollama-runner` |
@@ -201,6 +201,7 @@ sudo docker compose logs harness
 |---|---|
 | `[fatal] policy not found: /config/fs_policy.yaml` | Проверить, что `./config/` существует и смонтирован |
 | `cannot initialize fs guard: workspace root does not exist` | Проверить, что `./workspace/` существует |
+| `mTLS не сконфигурирован: нужны GATEWAY_CLIENT_CERT/KEY/CA_CERT` | Не смонтированы сертификаты в `harness`. Проверьте `docker-compose.yml`, секция `volumes` сервиса `harness` |
 | `Permission denied` в логах | Совпадают ли UID/GID (см. выше) |
 
 ## `audit.jsonl` растёт без остановки
@@ -305,9 +306,85 @@ curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
 `download.docker.com` открывается правильно, что DNS не подменён,
 что сертификат TLS валиден.
 
+## `auth_fail` в gateway.jsonl с reason=`mtls_not_verified`
+
+**Что произошло:** `model-gateway` получил запрос, у которого
+`X-Client-Verify` отсутствует или не равен `SUCCESS`. Это значит,
+что запрос пришёл **не через nginx** — либо напрямую от другого
+контейнера в `internal-net`, либо от процесса на хосте.
+
+**Проверьте:**
+
+```bash
+# Список контейнеров в gateway-internal-net:
+sudo docker network inspect paranoid-harness_gateway-internal-net \
+  --format '{{range .Containers}}{{.Name}} {{end}}'
+
+# Ожидается: gateway-tls и model-gateway. Любой третий — аномалия.
+```
+
+**Это защита, не поломка.** Запрос отвергнут корректно.
+
+## `gateway-tls` не стартует
+
+**Проверьте логи:**
+
+```bash
+sudo docker compose logs gateway-tls
+```
+
+**Частые причины:**
+
+| Сообщение | Решение |
+|---|---|
+| `[emerg] cannot load certificate "/certs/server.crt"` | Не смонтирован `./certs/server.crt`. Запустите `bash scripts/gateway-certs.sh certs` |
+| `[emerg] cannot load certificate key "/certs/server.key"` | Права `0600`, nginx master = root. Проверьте `ls -la certs/server.key` |
+| `chown("/tmp/nginx/...", ...) failed` | Проверьте, что в `docker-compose.yml` у `gateway-tls` есть `cap_add: [CHOWN, SETUID, SETGID]` |
+| `mkdir("/tmp/nginx/...") failed` | Не отработал `40-create-tmp-nginx.sh`. Проверьте, что он в `/docker-entrypoint.d/` |
+
+## `model-gateway` не стартует
+
+**Проверьте логи:**
+
+```bash
+sudo docker compose logs model-gateway
+```
+
+**Частые причины:**
+
+| Сообщение | Решение |
+|---|---|
+| `ConfigError: GATEWAY_CONFIG file not found` | Не смонтирован `config/gateway_clients.yaml`. Проверьте `docker-compose.yml`, секция `volumes` сервиса `model-gateway` |
+| `ConfigError: GATEWAY_HMAC_KEY must be at least 32 chars` | `GATEWAY_HMAC_KEY` пуст или короток. Проверьте `.env` |
+| `ConfigError: CA cert not found at /certs/ca.crt` | Не смонтирован `./certs/ca.crt`. Запустите `bash scripts/gateway-certs.sh certs` |
+| `RuntimeError: server cert SAN ... lacks required 'gateway-tls'` | `server.crt` выпущен с другим SAN. Перегенерируйте через `gateway-certs.sh` |
+| `ConfigError: client 'X': token_sha256 must be 64 hex chars` | Плейсхолдер `REPLACE_WITH_*_HASH` не был заменён. Запустите `bash scripts/bootstrap.sh` |
+
+## `[BLOCKED] Ввод похож на попытку промпт-инъекции`
+
+**Что произошло:** `InjectionGuard` посчитал пользовательский ввод
+подозрительным.
+
+**Причины:**
+
+- Фраза вида «ignore previous instructions».
+- Невидимые Unicode-символы (zero-width, bidi override).
+- Гомоглифы (например, `ignоre` с кириллической `о`).
+
+**Что делать:**
+
+- Переформулировать запрос простыми словами.
+- Если это легитимный вопрос **про** инъекции (например, «объясни,
+  что означает `ignore previous instructions`») — оберните фразу в
+  кавычки или экранируйте: `InjectionGuard` менее агрессивен к
+  явно цитируемому тексту.
+
 ## Что смотреть в первую очередь
 
-1. `logs/audit.jsonl` — что модель вызывала и с какими аргументами.
+1. `logs/audit.jsonl` и `logs/gateway.jsonl` — что модель вызывала
+   и какие запросы пришли в гейтвей.
 2. `sudo docker compose logs harness` — ошибки Python.
 3. `sudo docker compose logs api-proxy` — если проблема с `api_call`.
 4. `sudo docker compose logs ollama-runner` — если проблема с моделью.
+5. `sudo docker compose logs model-gateway` — если проблема с
+   аутентификацией или профилем.

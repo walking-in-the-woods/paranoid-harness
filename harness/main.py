@@ -34,13 +34,20 @@ def load_config() -> dict:
         fs_policy = yaml.safe_load(fh)
 
     return {
-        "ollama_host": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+        "ollama_host": os.environ.get(
+            "OLLAMA_HOST", "http://localhost:11434"
+        ),
         "model": os.environ.get("HARNESS_MODEL", "qwen3:8b"),
         "workspace_dir": os.environ.get("WORKSPACE_DIR", "/workspace"),
         "api_proxy_url": os.environ.get("API_PROXY_URL", ""),
         "proxy_secret": os.environ.get("PROXY_SECRET", ""),
         "audit_path": os.environ.get("AUDIT_PATH", "/logs/audit.jsonl"),
         "fs_policy": fs_policy,
+        # --- Гейтвей (mTLS) ---
+        "gateway_token": os.environ.get("GATEWAY_TOKEN", ""),
+        "gateway_client_cert": os.environ.get("GATEWAY_CLIENT_CERT", ""),
+        "gateway_client_key": os.environ.get("GATEWAY_CLIENT_KEY", ""),
+        "gateway_ca_cert": os.environ.get("GATEWAY_CA_CERT", ""),
     }
 
 
@@ -99,7 +106,8 @@ def main() -> None:
             try:
                 outcomes = session.apply(result["pending_writes"], code)
             except Exception as e:
-                outcomes = [f"[ERROR] apply failed: {type(e).__name__}: {e}"]
+                outcomes = [f"[ERROR] apply failed: "
+                            f"{type(e).__name__}: {e}"]
 
             print()
             for line in outcomes:
@@ -108,12 +116,11 @@ def main() -> None:
             audit.write(
                 "apply_result",
                 outcomes=outcomes,
-                nonce_matched=all("[CANCELLED]" not in o for o in outcomes),
+                nonce_matched=all(
+                    "[CANCELLED]" not in o for o in outcomes
+                ),
             )
 
-            # Помечаем ТОЛЬКО реально записанные файлы, по КАНОНИЧЕСКОМУ
-            # пути — чтобы "./notes/a.md" и "notes/a.md" не разошлись
-            # в _written_paths.
             for line, w in zip(outcomes, result["pending_writes"]):
                 if line.startswith("[OK]"):
                     agent.mark_written(w["canonical"])

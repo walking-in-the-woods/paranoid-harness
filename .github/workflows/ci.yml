@@ -2,91 +2,427 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, release-*]
   pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  # Тестовые модели берутся из repo variables с фолбэком на дефолт.
-  # Меняются без правок кода: Settings → Secrets and variables → Actions → Variables.
-  SMOKE_MODEL: ${{ vars.SMOKE_MODEL || 'qwen3:1.7b' }}
-  SMOKE_MODEL_SMALL: ${{ vars.SMOKE_MODEL_SMALL || 'qwen3:0.6b' }}
+    branches: [main]
 
 jobs:
-
-  unit-tests:
-    name: Unit tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            harness/requirements.txt
-            requirements-dev.txt
-      - run: |
-          python -m pip install --upgrade pip
-          pip install -r harness/requirements.txt
-          pip install -r requirements-dev.txt
-      - run: pytest tests/ --ignore=tests/smoke -v
 
-  smoke-test:
-    name: Smoke test (${{ matrix.model }})
-    runs-on: ubuntu-24.04
-    needs: unit-tests
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - model: ${{ vars.SMOKE_MODEL_SMALL || 'qwen3:0.6b' }}
-            tool_capable: "false"
-          - model: ${{ vars.SMOKE_MODEL || 'qwen3:1.7b' }}
-            tool_capable: "true"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            harness/requirements.txt
-            requirements-dev.txt
-      - name: Start ollama
+      - name: Ensure scripts are executable
         run: |
-          docker run -d --name ollama -p 11434:11434 ollama/ollama:latest
-          for i in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null; then exit 0; fi
-            sleep 1
+          set -euo pipefail
+          chmod 0755 scripts/*.sh
+          chmod 0755 scripts/*.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+              model_gateway/gateway.py \
+              model_gateway/cert_verify.py \
+              scripts/check-image-pinning.py \
+              scripts/check-workflow-uses-runner.py
+
+          bash -n scripts/filename-pattern.env
+          bash -n scripts/gateway-certs.sh
+          bash -n scripts/gateway-tokens.sh
+          bash -n scripts/pin-images.sh
+          bash -n scripts/check-smoke-cleanup.sh
+          bash -n scripts/check-file-contains-once.sh
+          bash -n scripts/check-file-excludes-pattern.sh
+          bash -n scripts/check-file-matches-pattern.sh
+          bash -n scripts/self-test-filename-pattern.sh
+          bash -n scripts/self-test-smoke-cleanup.sh
+          bash -n scripts/self-test-file-contains-once.sh
+          bash -n scripts/self-test-file-excludes-pattern.sh
+          bash -n scripts/self-test-file-matches-pattern.sh
+          bash -n scripts/self-test-image-pinning.sh
+          bash -n scripts/self-test-workflow-check.sh
+          bash -n scripts/run-self-tests.sh
+          bash -n scripts/verify-project.sh
+          echo "[+] syntax OK"
+
+      - name: Check image pinning
+        run: |
+          set -euo pipefail
+          strict_flag=""
+          if [[ "${GITHUB_REF}" == refs/heads/main ]] || \
+             [[ "${GITHUB_REF}" == refs/heads/release-* ]]; then
+              strict_flag="--strict"
+          fi
+          python scripts/check-image-pinning.py ${strict_flag} \
+              model_gateway/Dockerfile \
+              gateway_tls/Dockerfile \
+              api_proxy/Dockerfile \
+              harness/Dockerfile \
+              docker-compose.yml
+
+      - name: Verify cert generation
+        run: |
+          set -euo pipefail
+          certs_dir="$(mktemp -d)"
+          trap 'rm -rf "${certs_dir}"' EXIT
+
+          bash scripts/gateway-certs.sh "${certs_dir}" \
+              harness webui
+
+          for client_name in harness webui; do
+              san_output=$(openssl x509 \
+                  -in "${certs_dir}/${client_name}.crt" \
+                  -noout -ext subjectAltName) || {
+                  echo "::error::cannot read SAN for ${client_name}"
+                  exit 1
+              }
+              if ! printf '%s\n' "${san_output}" \
+                      | grep -qE "DNS:${client_name}([[:space:],]|$)"; then
+                  echo "::error::SAN missing for ${client_name}"
+                  printf '%s\n' "${san_output}" >&2
+                  exit 1
+              fi
+
+              eku_output=$(openssl x509 \
+                  -in "${certs_dir}/${client_name}.crt" \
+                  -noout -ext extendedKeyUsage) || {
+                  echo "::error::cannot read EKU for ${client_name}"
+                  exit 1
+              }
+              if ! printf '%s\n' "${eku_output}" \
+                      | grep -q "TLS Web Client Authentication"; then
+                  echo "::error::EKU clientAuth missing for ${client_name}"
+                  printf '%s\n' "${eku_output}" >&2
+                  exit 1
+              fi
+              echo "[+] case 'cert ${client_name}' OK"
           done
-          echo "::error::ollama failed to start"
-          docker logs ollama
-          exit 1
-      - name: Pull model
-        run: |
-          docker exec ollama ollama pull ${{ matrix.model }}
-          docker exec ollama ollama list
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r harness/requirements.txt -r requirements-dev.txt
-      - name: Run smoke tests
+
+          bash scripts/gateway-certs.sh "${certs_dir}" harness-prod
+          san_output=$(openssl x509 \
+              -in "${certs_dir}/harness-prod.crt" \
+              -noout -ext subjectAltName) || {
+              echo "::error::cannot read SAN for harness-prod"
+              exit 1
+          }
+          if ! printf '%s\n' "${san_output}" \
+                  | grep -qE 'DNS:harness-prod([[:space:],]|$)'; then
+              echo "::error::SAN for harness-prod is missing or wrong"
+              printf '%s\n' "${san_output}" >&2
+              exit 1
+          fi
+          echo "[+] case 'cert harness-prod SAN correct' OK"
+
+      - name: Import check
         env:
-          OLLAMA_HOST: http://127.0.0.1:11434
-          SMOKE_MODEL: ${{ matrix.model }}
-          SMOKE_MODEL_SMALL: ${{ matrix.model }}
-          SMOKE_TOOL_CAPABLE: ${{ matrix.tool_capable }}
-        run: pytest tests/smoke -m smoke -v -s
-      - name: Dump ollama logs on failure
-        if: failure()
-        run: docker logs ollama || true
-      - name: Stop ollama
-        if: always()
-        run: docker rm -f ollama || true
+          GATEWAY_HMAC_KEY: "00000000000000000000000000000000"
+        run: |
+          set -euo pipefail
+          cd model_gateway
+          TMP=$(mktemp -d)
+          trap 'rm -rf "${TMP}"' EXIT
+
+          openssl genrsa -out "$TMP/ca.key" 2048 2>/dev/null
+          openssl req -x509 -new -nodes -key "$TMP/ca.key" -days 1 \
+              -subj "/CN=ci-test-ca" \
+              -addext "basicConstraints=critical,CA:TRUE" \
+              -addext "keyUsage=critical,keyCertSign,cRLSign" \
+              -out "$TMP/ca.crt" 2>/dev/null
+
+          cat > "$TMP/cfg.yaml" <<'YAML'
+          upstream:
+            base_url: "http://localhost:11434"
+            model_allowlist: ["qwen3:8b"]
+            default_model: "qwen3:8b"
+          limits:
+            global_max_concurrent: 4
+          clients:
+            - name: "ci"
+              token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+          YAML
+
+          GATEWAY_CONFIG="$TMP/cfg.yaml" \
+          GATEWAY_AUDIT_PATH="$TMP/audit.jsonl" \
+          GATEWAY_CA_CERT="$TMP/ca.crt" \
+          PYTHONPATH=. \
+          python - <<'PYCODE'
+          import gateway, cert_verify
+          assert gateway.config.upstream_base_url == 'http://localhost:11434'
+          assert 'qwen3:8b' in gateway.config.model_allowlist
+          print('[+] import with config: OK')
+          PYCODE
+
+          out=$(PYTHONPATH=. GATEWAY_HMAC_KEY="$GATEWAY_HMAC_KEY" \
+                GATEWAY_CA_CERT="$TMP/ca.crt" \
+                python -c "import gateway" 2>&1) && {
+              echo "::error::import succeeded without GATEWAY_CONFIG"
+              exit 1
+          }
+          if ! echo "$out" | grep -q "GATEWAY_CONFIG file not found"; then
+              echo "::error::import failed for unexpected reason:"
+              echo "$out"
+              exit 1
+          fi
+          echo "[+] negative import check: expected failure"
+
+      - name: Import cert_verify alone
+        run: |
+          set -euo pipefail
+          cd model_gateway
+          python -c "import cert_verify; print('[+] cert_verify import OK')"
+
+      - name: Verify check-smoke-cleanup.sh has single ls line
+        run: |
+          set -euo pipefail
+          bash scripts/check-file-contains-once.sh \
+              scripts/check-smoke-cleanup.sh \
+              'ls -la "${artifact_path}" >&2'
+          echo "[+] case 'check-smoke-cleanup single ls line' OK"
+
+      - name: Verify docs/development.md hygiene
+        run: |
+          set -euo pipefail
+          bash scripts/check-file-excludes-pattern.sh \
+              docs/development.md \
+              'Правило self-test для CI-проверок'
+          bash scripts/check-file-excludes-pattern.sh \
+              docs/development.md \
+              'правятся в ближайшей итерации'
+          echo "[+] case 'docs/development.md hygiene' OK"
+
+      - name: Run self-tests
+        run: |
+          set -euo pipefail
+          bash scripts/run-self-tests.sh
+
+      - name: Verify CI uses runner
+        run: |
+          set -euo pipefail
+          python3 scripts/check-workflow-uses-runner.py \
+              .github/workflows/ci.yml
+          echo "[+] case 'workflow uses runner' OK"
+
+      - name: Verify ${OLDPWD} not used
+        run: |
+          set -euo pipefail
+          oldpwd_hits_file="$(mktemp)"
+          trap 'rm -f "${oldpwd_hits_file}"' EXIT
+          grep_failed=0
+
+          for search_root in docs scripts .github README.md; do
+              [[ -e "${search_root}" ]] || continue
+              set +e
+              grep -rFn '${OLDPWD}' "${search_root}" \
+                  >> "${oldpwd_hits_file}"
+              rc=$?
+              set -e
+              case "${rc}" in
+                  0|1) ;;
+                  *)
+                      echo "FAIL: grep rc=${rc} in ${search_root}" >&2
+                      grep_failed=1
+                      ;;
+              esac
+          done
+
+          [[ "${grep_failed}" -eq 0 ]] || exit 1
+          [[ ! -s "${oldpwd_hits_file}" ]] || {
+              echo "FAIL: \${OLDPWD} found:" >&2
+              cat "${oldpwd_hits_file}" >&2
+              exit 1
+          }
+          echo "[+] case '\${OLDPWD} not used' OK"
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: static-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        # Зависимости — из requirements-файлов проекта.
+        # harness/requirements.txt содержит ollama, PyYAML, httpx;
+        # requirements-dev.txt — pytest, pytest-timeout, fastapi,
+        # uvicorn, httpx, cryptography.
+        run: |
+          python -m pip install --quiet \
+              -r harness/requirements.txt \
+              -r requirements-dev.txt
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          # pytest.ini задаёт pythonpath = . api_proxy model_gateway,
+          # поэтому все модули (harness, gateway, proxy) находятся
+          # из корня репозитория. smoke отключён: требует запущенной
+          # Ollama.
+          python -m pytest tests/ \
+              --ignore=tests/smoke \
+              -v
+
+  docker-smoke:
+    name: Docker smoke (gateway-tls)
+    runs-on: ubuntu-latest
+    needs: static-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure scripts are executable
+        run: |
+          set -euo pipefail
+          chmod 0755 scripts/*.sh
+          chmod 0755 scripts/*.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Prepare dummy env
+        run: |
+          set -euo pipefail
+          cat > .env <<'EOF'
+          PROXY_SECRET=dummy-for-config-interpolation
+          GATEWAY_HMAC_KEY=dummy-for-config-interpolation
+          HARNESS_GATEWAY_TOKEN=dummy-for-config-interpolation
+          WEBUI_GATEWAY_TOKEN=dummy-for-config-interpolation
+          OLLAMA_IMAGE=ollama/ollama:latest
+          UID=1000
+          GID=1000
+          HARNESS_MODEL=qwen3:8b
+          EOF
+
+      - name: Verify gateway-tls capabilities
+        run: |
+          set -euo pipefail
+          docker compose config gateway-tls > /tmp/gt.yaml
+          python3 - <<'PYTHON'
+          import sys
+          import yaml
+
+          with open("/tmp/gt.yaml") as stream:
+              config = yaml.safe_load(stream)
+
+          services = config.get("services") or {}
+          gateway_tls = services.get("gateway-tls") or {}
+          actual = set(gateway_tls.get("cap_add") or [])
+
+          required = {"CHOWN", "SETUID", "SETGID"}
+          missing = required - actual
+          if missing:
+              print(f"::error::missing capabilities: {sorted(missing)}",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          unexpected = actual - required
+          if unexpected:
+              print(f"::error::unexpected capabilities: {sorted(unexpected)}",
+                    file=sys.stderr)
+              sys.exit(1)
+
+          print(f"[+] gateway-tls capabilities OK: {sorted(actual)}")
+          PYTHON
+
+      - name: gateway-tls smoke
+        run: |
+          set -euo pipefail
+
+          smoke_certs_dir="$(mktemp -d)"
+          cleanup() {
+              rm -rf certs-smoke docker-compose.smoke.yml \
+                  "${smoke_certs_dir:-}"
+          }
+          trap cleanup EXIT
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -keyout "${smoke_certs_dir}/server.key" \
+              -out    "${smoke_certs_dir}/server.crt" \
+              -subj   "/CN=gateway-tls" \
+              -addext "subjectAltName=DNS:gateway-tls,DNS:localhost" \
+              -addext "extendedKeyUsage=critical,serverAuth" \
+              -addext "basicConstraints=critical,CA:FALSE" \
+              -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+              2>/dev/null
+          cp "${smoke_certs_dir}/server.crt" "${smoke_certs_dir}/ca.crt"
+
+          mkdir -p certs-smoke
+          cp "${smoke_certs_dir}/server.crt" certs-smoke/
+          cp "${smoke_certs_dir}/server.key" certs-smoke/
+          cp "${smoke_certs_dir}/ca.crt"     certs-smoke/
+
+          cat > docker-compose.smoke.yml <<'YAML'
+          services:
+            gateway-tls:
+              volumes:
+                - ./certs-smoke/ca.crt:/certs/ca.crt:ro
+                - ./certs-smoke/server.crt:/certs/server.crt:ro
+                - ./certs-smoke/server.key:/certs/server.key:ro
+          YAML
+
+          compose_command=(docker compose
+              -f docker-compose.yml
+              -f docker-compose.smoke.yml)
+
+          "${compose_command[@]}" build gateway-tls
+          "${compose_command[@]}" up -d gateway-tls
+
+          for _ in $(seq 1 15); do
+              if "${compose_command[@]}" exec -T gateway-tls \
+                      nginx -t >/dev/null 2>&1; then
+                  break
+              fi
+              sleep 1
+          done
+
+          "${compose_command[@]}" exec -T gateway-tls nginx -t
+          echo "[+] case 'gateway-tls nginx -t' OK"
+
+          owner=$("${compose_command[@]}" exec -T gateway-tls \
+              stat -c '%U' /tmp/nginx)
+          if [[ "${owner}" != "nginx" ]]; then
+              echo "::error::/tmp/nginx owner=${owner}, expected nginx"
+              "${compose_command[@]}" logs gateway-tls
+              exit 1
+          fi
+          echo "[+] case 'gateway-tls /tmp/nginx owner' OK"
+
+          if "${compose_command[@]}" logs gateway-tls 2>&1 \
+                  | grep -qiE 'chown.*failed|mkdir.*failed'; then
+              echo "::error::nginx reported chown/mkdir failure"
+              "${compose_command[@]}" logs gateway-tls
+              exit 1
+          fi
+          echo "[+] case 'gateway-tls no chown/mkdir errors' OK"
+
+          if ! "${compose_command[@]}" exec -T gateway-tls \
+                  wget -qO- http://127.0.0.1:8081/health; then
+              echo "::error::nginx healthcheck failed"
+              exit 1
+          fi
+          echo "[+] case 'gateway-tls healthcheck' OK"
+
+      - name: Verify smoke cleanup
+        if: always() && !cancelled()
+        run: |
+          set -euo pipefail
+          bash scripts/check-smoke-cleanup.sh .
+          echo "[+] case 'smoke cleanup' OK"

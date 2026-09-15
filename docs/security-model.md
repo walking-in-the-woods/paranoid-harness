@@ -10,6 +10,10 @@
 - **Целостность весов модели.** Подмена снапшота Ollama должна быть
   обнаружена.
 - **Устойчивость хоста.** Модель не должна уронить систему.
+- **Пропускная способность `model-gateway`.** Один клиент не должен
+  монополизировать модель.
+- **Конфиденциальность промптов.** Содержимое запросов и ответов не
+  должно попадать в аудит.
 
 ## Акторы
 
@@ -20,22 +24,56 @@
 - **Содержимое `workspace/`.** Не доверяем. Файл может содержать
   инструкции, адресованные модели.
 - **Внешние API.** Не доверяем. Ответ может содержать инъекцию.
-- **Цепочка поставки.** PyPI, Docker Hub, GitHub — не доверяем.
+- **Клиенты гейтвея** (`harness`, `webui`, инструментальные модули).
+  Доверяем в разной степени: `harness` — доверенный, остальные —
+  ограниченные профилем.
+- **Цепочка поставки.** PyPI, Docker Hub, GitHub, реестр Ollama — не
+  доверяем.
 
 ## Защита
 
-### Сеть
+### Сеть (harness-сторона)
 
 | Угроза | Защита |
 |---|---|
-| Модель обращается в интернет | `internal: true`; в `internal-net` нет маршрута наружу |
+| Модель обращается в интернет | `internal: true` на всех сетях, кроме `external-net`; в `internal-net` и `gateway-net` нет маршрута наружу |
 | Данные утекают через `api_call` | Прокси знает только фиксированные маршруты; хост нельзя подставить |
 | SSRF через редирект | `follow_redirects=False` |
 | Обход маршрута через `@` в URL | Хост берётся из `ROUTES`, не из запроса |
-| Доступ к прокси из чужого контейнера | `X-Proxy-Secret` |
+| Доступ к прокси из чужого контейнера | `api-proxy` только в `proxy-net`, доступен лишь `harness` |
 | DoS через большой ответ | `MAX_REQ_BODY`, `MAX_RESP_BODY` |
 
-### Файловая система
+### Гейтвей (model-gateway)
+
+| Угроза | Защита |
+|---|---|
+| Клиент A притворяется клиентом B | mTLS: клиентский сертификат подписан CA, SAN DNS = имя профиля. nginx проверяет cert, гейтвей верифицирует подпись через `cryptography`. Токен (SHA256 в YAML) — вторая линия |
+| Подмена CN в заголовке скомпрометированным nginx | Python верифицирует подпись сертификата, а не доверяет `X-Client-CN` |
+| Прямое подключение к `model-gateway` в обход nginx | Обязательная проверка `X-Client-Verify == "SUCCESS"` до верификации подписи. Заголовок выставляет только nginx (`proxy_set_header X-Client-Verify $ssl_client_verify`); при обходе он отсутствует или имеет значение иное, чем `SUCCESS` |
+| Сертификат с EKU=serverAuth | Отказ: проверяется EKU=clientAuth |
+| Сертификат с BasicConstraints CA:TRUE | Отказ |
+| Сертификат без KeyUsage.digitalSignature | Отказ |
+| SHA-1 подпись | Отказ (только SHA-256/384/512) |
+| Сертификат без SAN DNS | Отказ |
+| SAN DNS != имя клиента | Отказ |
+| Non-critical расширение | Отказ: BC/KU/EKU/SAN обязаны быть critical |
+| Истёкший сертификат | Отказ |
+| Подпись не от CA | Отказ |
+| Сертификат от другого CA с SAN=harness | Отказ (подпись проверяется) |
+| Перехват токена в сети | TLS 1.3, mTLS |
+| ARP-спуфинг соседа | mTLS даёт аутентичность на уровне TLS |
+| Клиент DoS-ит других стримами | Per-client и global семафоры держатся до конца стрима |
+| Клиент отправляет огромный JSON | Middleware отклоняет >1 МБ по Content-Length; nginx — тоже |
+| Клиент включает tools, которых нет в allowlist | Вычищаются `tools`, `functions`, `tool_choice`, `tool_calls`, `function_call`, `tool_call_id`, `name` |
+| Клиент шлёт `num_predict: -1` | Clamp до `[1, max_num_predict]` |
+| Клиент шлёт `keep_alive: -1` | Парсинг всех типов; отрицательные → `30m` |
+| Клиент обходит профиль через `/api/generate` | Единый `_apply_profile` для всех эндпоинтов |
+| Брутфорс низкоэнтропийных промптов по аудиту | `prompt_hash` — HMAC с серверным ключом |
+| Утечка конфига | В конфиге только SHA256 токенов и SAN; токены невосстановимы |
+| Утечка аудита | Ни промптов, ни ответов, только метаданные, IP, HMAC-хеш |
+| DoS на auth-fail | Per-IP rate limiter ДО аутентификации. Лимитирует **все** попытки (не только неудачные) — иначе спам дорогой криптографической верификацией `verifier.verify` упирался бы в CPU. Значение — `limits.global_auth_fail_per_minute` в YAML. `auth_fail` не пишется с `fsync` |
+
+### Файловая система (harness-сторона)
 
 | Угроза | Защита |
 |---|---|
@@ -55,7 +93,7 @@
 | Угроза | Защита |
 |---|---|
 | «Ignore previous instructions» в файле | `<tool_result trust="untrusted">` + правило в system prompt |
-| XML-теги ролей в данных | `neutralize_data_block` экранирует расширенный набор тегов: system/assistant/user/tool/tool_result/tool_use/tool_uses/tool_call/tool_calls/tool_response/tool_responses/tool_output/tool_outputs/instruction/function_call/function_calls/function_result/function_results/result/results/response/output/prompt/context/thought. Обычные HTML-теги на ролевые префиксы (`<toolbar>`, `<toolbox>`, `<systemd>`) не экранируются благодаря `\b` в `_TAG_RE`. |
+| XML-теги ролей в данных | `neutralize_data_block` экранирует расширенный набор тегов: system/assistant/user/tool/tool_result/tool_results/tool_use/tool_uses/tool_call/tool_calls/tool_response/tool_responses/tool_output/tool_outputs/instruction/function_call/function_calls/function_result/function_results/result/results/response/output/prompt/context/thought. Обычные HTML-теги на ролевые префиксы (`<toolbar>`, `<toolbox>`, `<systemd>`) не экранируются благодаря `\b` в `_TAG_RE`. |
 | Тройные бэктики в данных | Заменяются на `'''` |
 | Служебная метка «truncated» в теле | Метаданные — в атрибутах тега, не в теле |
 | Самоинъекция через свой же записанный файл | `_written_paths` с каноническими путями, read-after-write block |
@@ -64,7 +102,7 @@
 | Гомоглифы в тексте инъекции | Транслитерация кириллица/греческий/fullwidth → ASCII |
 | Обфускация в `scan_payload` через гомоглиф | Тот же `normalize` применяется к содержимому |
 
-### Запись
+### Запись (harness-сторона)
 
 | Угроза | Защита |
 |---|---|
@@ -81,7 +119,7 @@
 | MITM на apt-репозитории Docker | Fingerprint GPG сверяется с официальным |
 | Подмена PyPI-пакета | `uv.lock` с хешами + `uv sync --locked` + cooldown 7 дней |
 | Свежий вредоносный релиз | `exclude-newer = "7 days"` в `pyproject.toml` |
-| Подмена тега Docker-образа | Опциональный digest-пиннинг |
+| Подмена тега Docker-образа | Опциональный digest-пиннинг (`pin-images.sh`) |
 | Подмена весов модели | Снапшот + sha256-манифест при промоушене |
 | Подмена тега модели | `HARNESS_MODEL_DIGEST` (опционально) |
 | Мутабельный `alpine:3.19` в sync-model | `ALPINE_IMAGE` override + предупреждение |
@@ -89,6 +127,14 @@
 
 ## Что осознанно не защищено
 
+- **Proof-of-possession.** nginx не проверяет владение приватным
+  ключом клиента после TLS-handshake; при компромиссе nginx + доступе
+  к клиентскому сертификату возможна подделка клиента. См.
+  `docs/design-notes.md`.
+- **Компрометация `ca.key`.** Рушит всю цепочку доверия. Митигация —
+  offline-хранение.
+- **Компрометация nginx.** Может предъявить любой валидный клиентский
+  сертификат, которым завладел. Требует root-доступа на хосте.
 - **Отложенное исполнение.** Файл `.txt` с `sleep 3600 && rm -rf` не
   блокируется: он не `.sh`.
 - **Пользователь, читающий diff невнимательно.** Если вы ввели nonce,
@@ -104,34 +150,11 @@
 1. **Включить digest-пиннинг базовых образов** (раздел A в
    инструкции).
 2. **Задать `HARNESS_MODEL_DIGEST`** в `.env`.
-3. **Включить `read_only: true` на `ollama-runner`** (см. ниже).
+3. **Включить `read_only: true` на `ollama-runner`** (см.
+   `docs/design-notes.md`, раздел capabilities).
 4. **Запустить Docker в rootless-режиме** или с userns-remap.
 5. **Разместить `workspace/` на отдельном разделе/диске.**
-6. **Регулярно проверять `logs/audit.jsonl`** на неожиданные
-   `propose_write`.
-
-### Дополнительно: `read_only` на `ollama-runner`
-
-По умолчанию контейнер writable: Ollama может писать в `/root/.cache`,
-`/root/.config` и подобные пути вне тома моделей. Чтобы включить
-hardening:
-
-```yaml
-ollama-runner:
-  read_only: true
-  tmpfs:
-    - /tmp:size=1g
-    - /root/.cache:size=512m
-    - /root/.config:size=64m
-```
-
-После правки — `docker compose up -d --force-recreate ollama-runner`
-и проверка, что модель отвечает:
-
-```bash
-docker compose exec ollama-runner ollama list
-```
-
-Если Ollama пишет в неожиданное место — она вернёт ошибку, и
-можно добавить соответствующий tmpfs. Тестируйте перед включением
-в production.
+6. **Регулярно проверять `logs/audit.jsonl` и `logs/gateway.jsonl`**
+   на неожиданные `propose_write` и `auth_fail`.
+7. **Перенести `certs/ca.key` в offline-хранилище** после первичной
+   генерации клиентских сертификатов.

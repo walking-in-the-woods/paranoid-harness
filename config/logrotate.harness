@@ -1,4 +1,4 @@
-# Logrotate для audit.jsonl.
+# Logrotate для audit-логов harness и gateway.
 #
 # Установка:
 #   sudo cp config/logrotate.harness /etc/logrotate.d/harness
@@ -9,6 +9,18 @@
 # Или запустите вручную из harness-project:
 #   sed "s|@PROJECT_PATH@|$(pwd)|; s|@UID@|$(id -u)|; s|@GID@|$(id -g)|" \
 #     config/logrotate.harness | sudo tee /etc/logrotate.d/harness
+#
+# ── Почему `copytruncate` только для audit.jsonl ─────────────────────────
+#
+# * `audit.jsonl`: `AuditLog` пишет через `open(..., "a")`, не удерживая
+#   файловый дескриптор между вызовами. `copytruncate` устраняет
+#   гонку между `mv` и следующим `open` (иначе запись ушла бы в
+#   удалённый файл).
+# * `gateway.jsonl`: `AuditWriter` тоже открывает файл на каждый
+#   `write`, но ротация без `copytruncate` даёт более чистую семантику
+#   с `create`: файл пересоздаётся сразу с правильными правами
+#   (0640), без окна, в котором новый файл имеет права по умолчанию.
+#   См. docs/operations.md, раздел «Ротация audit-логов».
 
 @PROJECT_PATH@/logs/audit.jsonl {
     weekly
@@ -19,4 +31,14 @@
     notifempty
     copytruncate
     create 0644 @UID@ @GID@
+}
+
+@PROJECT_PATH@/logs/gateway.jsonl {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 @UID@ @GID@
 }

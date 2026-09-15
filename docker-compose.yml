@@ -1,13 +1,16 @@
-# Формат Compose v2 (без поля `version:`).
+# Compose v2.
 #
-# Ключи `mem_limit` и `cpus` — из Compose v2, работают в docker compose
-# v2 binary. В устаревшей схеме v3 они не поддерживались; здесь не
-# используется `deploy.resources`, чтобы не тянуть swarm-синтаксис.
+# Сети:
+#   gateway-net          — клиенты + gateway-tls. internal: true.
+#   gateway-internal-net — gateway-tls + model-gateway. internal: true.
+#   internal-net         — model-gateway + ollama-runner. internal: true.
+#   proxy-net            — harness + api-proxy. internal: true.
+#   external-net         — api-proxy + ollama-updater. bridge.
 
 services:
 
   ollama-runner:
-    image: ollama/ollama:latest
+    image: ${OLLAMA_IMAGE:?OLLAMA_IMAGE must be set in .env}
     container_name: ollama-runner
     networks: [internal-net]
     volumes:
@@ -20,12 +23,6 @@ services:
     mem_limit: 8g
     cpus: 4.0
     restart: unless-stopped
-    # Без read_only: true — Ollama может писать в /root/.cache,
-    # /root/.config и другие пути вне /root/.ollama. Оставлено
-    # writable для совместимости. Для paranoid-режима см.
-    # docs/security-model.md, раздел «Что сделать при чувствительных
-    # данных» — там описано, как включить read_only и какие пути
-    # смонтировать как tmpfs.
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 30s
@@ -33,7 +30,7 @@ services:
       retries: 5
 
   ollama-updater:
-    image: ollama/ollama:latest
+    image: ${OLLAMA_IMAGE:?OLLAMA_IMAGE must be set in .env}
     container_name: ollama-updater
     networks: [external-net]
     volumes:
@@ -48,11 +45,84 @@ services:
     cpus: 2.0
     profiles: ["updater"]
 
+  gateway-tls:
+    build: ./gateway_tls
+    container_name: gateway-tls
+    networks:
+      - gateway-net
+      - gateway-internal-net
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./certs/server.crt:/certs/server.crt:ro
+      - ./certs/server.key:/certs/server.key:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop: [ALL]
+    # SETUID/SETGID — master сбрасывает воркеров в user nginx.
+    # CHOWN — nginx master делает chown temp-каталогов на worker-user.
+    # NET_BIND_SERVICE не нужен: порты 8443/8081 > 1024.
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 128m
+    cpus: 0.5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  model-gateway:
+    build:
+      context: ./model_gateway
+      args:
+        RUNTIME_UID: "${UID:-1000}"
+        RUNTIME_GID: "${GID:-1000}"
+    container_name: model-gateway
+    networks:
+      - gateway-internal-net
+      - internal-net
+    volumes:
+      - ./config:/config:ro
+      - ./logs:/logs:rw
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./certs/server.crt:/certs/server.crt:ro
+    environment:
+      - GATEWAY_CONFIG=/config/gateway_clients.yaml
+      - GATEWAY_AUDIT_PATH=/logs/gateway.jsonl
+      - GATEWAY_HMAC_KEY=${GATEWAY_HMAC_KEY:?GATEWAY_HMAC_KEY must be set}
+      - GATEWAY_CA_CERT=/certs/ca.crt
+      - GATEWAY_SERVER_CERT=/certs/server.crt
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+    depends_on:
+      ollama-runner:
+        condition: service_healthy
+      gateway-tls:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   api-proxy:
     build: ./api_proxy
     container_name: api-proxy
     networks:
-      - internal-net
+      - proxy-net
       - external-net
     environment:
       - PROXY_SECRET=${PROXY_SECRET:?PROXY_SECRET must be set (see .env.example)}
@@ -67,7 +137,8 @@ services:
     cpus: 1.0
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -75,13 +146,22 @@ services:
   harness:
     build: ./harness
     container_name: harness
-    networks: [internal-net]
+    networks:
+      - gateway-net
+      - proxy-net
     volumes:
       - ./workspace:/workspace:rw
       - ./config:/config:ro
       - ./logs:/logs:rw
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - ./certs/harness.crt:/certs/client.crt:ro
+      - ./certs/harness.key:/certs/client.key:ro
     environment:
-      - OLLAMA_HOST=http://ollama-runner:11434
+      - OLLAMA_HOST=https://gateway-tls:8443
+      - GATEWAY_TOKEN=${HARNESS_GATEWAY_TOKEN:?}
+      - GATEWAY_CLIENT_CERT=/certs/client.crt
+      - GATEWAY_CLIENT_KEY=/certs/client.key
+      - GATEWAY_CA_CERT=/certs/ca.crt
       - HARNESS_MODEL=${HARNESS_MODEL:-qwen3:8b}
       - WORKSPACE_DIR=/workspace
       - CONFIG_DIR=/config
@@ -93,6 +173,10 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     depends_on:
       ollama-runner:
+        condition: service_healthy
+      model-gateway:
+        condition: service_healthy
+      gateway-tls:
         condition: service_healthy
     read_only: true
     tmpfs:
@@ -107,7 +191,13 @@ services:
     tty: true
 
 networks:
+  gateway-net:
+    internal: true
+  gateway-internal-net:
+    internal: true
   internal-net:
+    internal: true
+  proxy-net:
     internal: true
   external-net:
     driver: bridge

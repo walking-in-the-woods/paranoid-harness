@@ -63,7 +63,7 @@ plugins:
       default_handler: python
       handlers:
         python:
-          paths: [.]
+          paths: [. api_proxy]
           options:
             show_source: false
             show_root_heading: true
@@ -104,3 +104,4 @@ nav:
           - confirm: reference/confirm.md
           - audit: reference/audit.md
           - proxy: reference/proxy.md
+          - model-gateway: reference/gateway.md

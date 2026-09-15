@@ -11,6 +11,6 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
-
-# uv.lock и pyproject.toml НЕ игнорируются — они должны коммититься
-# для воспроизводимости окружения.
+certs/
+certs-smoke/
+docker-compose.smoke.yml

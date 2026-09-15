@@ -7,6 +7,12 @@
 * Аутентификация через X-Proxy-Secret.
 * Лимит размера request body и response body.
 * Базовое логирование в stdout -> docker json-file driver.
+
+Тело запроса читается stream-based (`_read_body_limited`):
+Content-Length проверяется первым как дешёвый барьер; chunked-запросы
+без Content-Length считаются по мере чтения. Раньше использовался
+`await request.body()`, который буферизовал ВСЁ тело до проверки
+размера — DoS на память при большом запросе.
 """
 
 from __future__ import annotations
@@ -50,6 +56,40 @@ MAX_REQ_BODY = 100_000
 MAX_RESP_BODY = 200_000
 
 
+async def _read_body_limited(request: Request, limit: int) -> bytes:
+    """Stream-based чтение тела с лимитом.
+
+    Не используем `await request.body()`: Starlette буферизует ВСЁ тело
+    до того, как мы проверим его размер, что даёт DoS на память при
+    большом запросе. Здесь считаем байты по мере чтения и прерываем
+    соединение, как только сумма превысила limit.
+
+    Content-Length проверяется первым как дешёвый барьер: если он есть
+    и уже больше limit — отвергаем без чтения. Chunked-запросы без
+    Content-Length тоже покрыты — счётчик работает на каждом chunk.
+    """
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            n = int(cl)
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="invalid Content-Length")
+        if n > limit:
+            raise HTTPException(status_code=413,
+                                detail="request too large")
+
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413,
+                                detail="request too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -70,10 +110,7 @@ async def proxy(
         log.info("unknown route=%s", route)
         raise HTTPException(status_code=404, detail="unknown route")
 
-    body = await request.body()
-    if len(body) > MAX_REQ_BODY:
-        log.warning("request body too large route=%s size=%d", route, len(body))
-        raise HTTPException(status_code=413, detail="request too large")
+    body = await _read_body_limited(request, MAX_REQ_BODY)
 
     headers = {
         k: v for k, v in request.headers.items()

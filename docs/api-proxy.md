@@ -40,6 +40,9 @@ sudo docker compose up -d api-proxy
 - **`follow_redirects=False`.** Upstream не уведёт трафик через 30x.
 - **`X-Proxy-Secret`.** Обязателен в каждом запросе.
 - **Лимиты.** `MAX_REQ_BODY` (100 КБ), `MAX_RESP_BODY` (200 КБ).
+  Тело читается stream-based через `_read_body_limited`: Content-Length
+  проверяется первым, chunked-запросы считаются по мере чтения —
+  буферизация до проверки размера не происходит.
 - **Белый список заголовков.** Только `content-type`, `accept`,
   `authorization`.
 

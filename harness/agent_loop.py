@@ -24,11 +24,26 @@
 DRY:
 * _wrap_tool_result — единая сборка конверта <tool_result>.
 * canonical_rel — единая нормализация пути для сравнений.
+
+Гейтвей:
+* Клиент Ollama строится через `_make_ollama_client`. В production
+  config содержит `gateway_client_cert`/`key`/`ca_cert` — создаётся
+  httpx.Client с mTLS. В тестах клиент инжектится через параметр
+  `client=` в `HarnessAgent.__init__` — mTLS-конфиг не требуется.
+
+Парсинг tool_call:
+* `_parse_tool_call` устойчив к malformed входу от модели (None,
+  строка, отсутствие `function`, нестроковый `name`). Возврат
+  ("", {}) вместо исключения — модель получает обратную связь
+  через _dispatch. На трёх точках отказа логируется усечённый
+  repr(tc)[:200]. См. docs/design-notes.md, раздел «Остаточные
+  риски»: этот лог не проходит через _redact_args.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from itertools import islice
 from pathlib import Path
@@ -40,6 +55,9 @@ import ollama
 from harness.audit import AuditLog
 from harness.fs_guard import FileSystemGuard
 from harness.injection_guard import InjectionGuard
+
+
+log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """\
@@ -192,15 +210,58 @@ MAX_WRITE_BYTES = 1_000_000
 MAX_API_RESPONSE = 100_000
 
 
+def _make_ollama_client(config: dict) -> ollama.Client:
+    """
+    Создаёт ollama.Client с mTLS к model-gateway через gateway-tls.
+
+    В production config содержит gateway_client_cert/key/ca_cert —
+    создаётся httpx.Client с verify=CA, cert=(crt, key). Прямое
+    подключение к ollama-runner невозможно: он в internal-net, куда
+    harness не подключён.
+
+    В тестах клиент инжектится через HarnessAgent(client=...), эта
+    функция не вызывается. RuntimeError здесь — fail-fast: если
+    production-конфиг без mTLS, лучше упасть на старте, чем молча
+    работать по незащищённому HTTP.
+    """
+    cert = config.get("gateway_client_cert")
+    key = config.get("gateway_client_key")
+    ca = config.get("gateway_ca_cert")
+
+    if not (cert and key and ca):
+        raise RuntimeError(
+            "mTLS не сконфигурирован: "
+            "нужны GATEWAY_CLIENT_CERT/KEY/CA_CERT"
+        )
+
+    http_client = httpx.Client(
+        verify=ca,
+        cert=(cert, key),
+        timeout=httpx.Timeout(180.0, connect=10.0),
+        follow_redirects=False,
+    )
+    return ollama.Client(
+        host=config["ollama_host"],
+        headers={"X-Gateway-Token": config.get("gateway_token", "")},
+        http_client=http_client,
+    )
+
+
 class HarnessAgent:
 
     def __init__(self, config: dict, fs_guard: FileSystemGuard,
-                 audit: AuditLog | None = None):
+                 audit: AuditLog | None = None, *,
+                 client: Any | None = None):
         self.config = config
         self.workspace = Path(config["workspace_dir"]).resolve()
         self.fs_guard = fs_guard
         self.injection = InjectionGuard()
-        self.client = ollama.Client(host=config["ollama_host"])
+        # Если client передан явно — используем его (тесты,
+        # альтернативные транспорты). Иначе строим mTLS-клиент
+        # из конфига; отсутствие mTLS-параметров в production —
+        # RuntimeError, fail-fast.
+        self.client = (client if client is not None
+                       else _make_ollama_client(config))
         self.model = config["model"]
         self.audit = audit or AuditLog("/dev/null")
 
@@ -302,10 +363,44 @@ class HarnessAgent:
 
     @staticmethod
     def _parse_tool_call(tc: Any) -> tuple[str, dict]:
-        fn = tc.get("function") if hasattr(tc, "get") else tc["function"]
-        name = fn.get("name") if hasattr(fn, "get") else fn["name"]
-        raw = fn.get("arguments") if hasattr(fn, "get") else fn.get("arguments")
+        """Парсит tool_call. Возвращает ("", {}) при malformed входе.
 
+        Модель — недоверенный источник: скомпрометированная или
+        ошибающаяся модель может вернуть tool_call без поля function,
+        с function=None, с нестроковым name или с arguments
+        произвольного типа. Ни один из этих случаев не должен ронять
+        сессию harness. Возврат ("", {}) уходит в _dispatch и
+        превращается в "ERROR: unknown tool ''" — модель получает
+        обратную связь и продолжает цикл.
+
+        Malformed-вход логируется на уровне WARNING с усечённым
+        repr(tc)[:200]. Это даёт диагностику в audit/stderr (что
+        именно вернула модель) без риска раздуть лог неограниченным
+        repr. Срезание до 200 символов сохраняет контекст ошибки
+        (имя функции, начало arguments) при худшем варианте — сотни
+        килобайт мусора от скомпрометированной модели.
+
+        ВАЖНО: log.warning не проходит через _redact_args. См.
+        docs/design-notes.md, раздел «Остаточные риски».
+        """
+        try:
+            fn = tc.get("function") if hasattr(tc, "get") else tc["function"]
+        except (KeyError, TypeError):
+            log.warning("malformed tool_call, missing 'function': %s",
+                        repr(tc)[:200])
+            return "", {}
+        if not isinstance(fn, dict):
+            log.warning("malformed tool_call, 'function' not a dict: %s",
+                        repr(tc)[:200])
+            return "", {}
+
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            log.warning("malformed tool_call, invalid 'name': %s",
+                        repr(tc)[:200])
+            return "", {}
+
+        raw = fn.get("arguments")
         if isinstance(raw, dict):
             args = raw
         elif isinstance(raw, str):
@@ -456,7 +551,10 @@ class HarnessAgent:
 
         danger = self.injection.scan_payload(content)
         if danger:
-            return f"REJECTED: содержимое совпало с опасным шаблоном ({danger})."
+            # Намеренно НЕ возвращаем `danger` (regex-паттерн) в
+            # сообщении: знание конкретной эвристики упрощает её
+            # обфускацию. Модель получает только факт отказа.
+            return "REJECTED: содержимое совпало с опасным шаблоном."
 
         p, err = self.fs_guard.resolve_write(rel)
         if p is None:

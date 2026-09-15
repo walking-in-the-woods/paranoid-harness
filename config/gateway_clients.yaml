@@ -1,0 +1,87 @@
+# Профили клиентов гейтвея.
+#
+# Токены хранятся ТОЛЬКО как SHA256. Сгенерировать:
+#   bash scripts/gateway-tokens.sh <name>
+# или автоматически: bash scripts/bootstrap.sh (заполняет placeholder'ы
+# реальными хешами и токены записывает в .env).
+#
+# ── Имя клиента и env-var ─────────────────────────────────────────────────
+#
+# CN клиентского сертификата = поле name. env-var и placeholder
+# вычисляются из имени по формуле:
+#
+#   PREFIX = name.upper().replace("-", "_")
+#   env-var     = PREFIX + "_GATEWAY_TOKEN"
+#   placeholder = "REPLACE_WITH_" + PREFIX + "_HASH"
+#
+# Примеры:
+#   harness          → HARNESS_GATEWAY_TOKEN,
+#                      REPLACE_WITH_HARNESS_HASH
+#   webui            → WEBUI_GATEWAY_TOKEN,
+#                      REPLACE_WITH_WEBUI_HASH
+#
+# ── Как добавить нового клиента ──────────────────────────────────────────
+#
+# 1. Скопировать блок из clients ниже, задать name и
+#    token_sha256: "REPLACE_WITH_<PREFIX>_HASH".
+# 2. В .env.example добавить строку <PREFIX>_GATEWAY_TOKEN=replace-...
+# 3. В scripts/bootstrap.sh добавить имя в CLIENTS=().
+# 4. Запустить bash scripts/bootstrap.sh — токен и хеш заполнятся
+#    автоматически. Клиентский сертификат сгенерирует
+#    gateway-certs.sh.
+
+upstream:
+  base_url: "http://ollama-runner:11434"
+  request_timeout_seconds: 180
+  connect_timeout_seconds: 5
+  model_allowlist:
+    - "qwen3:8b"
+    - "qwen3:1.7b"
+  default_model: "qwen3:8b"
+
+limits:
+  max_prompt_bytes: 200_000
+  max_num_predict: 4096
+  max_num_ctx: 8192
+  max_messages: 200
+  global_max_concurrent: 4
+  # Per-IP rate limit ДО аутентификации. Считает ВСЕ попытки, не только
+  # неудачные — стоит до verifier.verify, чтобы спам дорогой
+  # криптографической верификацией не упирался в CPU. Значение 200
+  # рассчитано на пиковую нагрузку harness (requests_per_minute: 120)
+  # с запасом на webui и на переподключения. Значение 10 конфликтовало
+  # с профилем harness (120 req/min): harness получал 429 после
+  # 10-го запроса в минуту.
+  global_auth_fail_per_minute: 200
+
+clients:
+
+  # harness — агент с доступом к инструментам (list_dir, read_file,
+  # propose_write, api_call). System prompt формируется клиентом;
+  # гейтвей его не переопределяет.
+  - name: "harness"
+    token_sha256: "REPLACE_WITH_HARNESS_HASH"
+    tools_enabled: true
+    allowed_tools: null
+    forced_system_prompt: null
+    requests_per_minute: 120
+    max_concurrent: 2
+    allow_stream: false
+    audit_label: "harness"
+
+  # webui — chat-only. Tools вырезаются полностью; system prompt
+  # навязан гейтвеем. Может использовать streaming.
+  - name: "webui"
+    token_sha256: "REPLACE_WITH_WEBUI_HASH"
+    tools_enabled: false
+    allowed_tools: []
+    forced_system_prompt: |
+      You are a helpful chat assistant running on a local machine.
+      You have NO tools: you cannot read files, execute code, or access
+      the internet. If the user asks for such actions, politely explain
+      that this interface is chat-only and suggest the proper module.
+      Answer in the user's language.
+    requests_per_minute: 60
+    max_concurrent: 2
+    allow_stream: true
+    audit_label: "webui"

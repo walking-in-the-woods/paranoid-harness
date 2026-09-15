@@ -4,9 +4,12 @@ End-to-end smoke: модель -> HarnessAgent -> tool call -> результа�
 Требует модель, поддерживающую tool calling (qwen3:1.7b или больше).
 На qwen3:0.6b тест скипается через SMOKE_TOOL_CAPABLE=false.
 
-В отличие от test_model_smoke.py, здесь проверяется вся цепочка tool
-calling: валидность формата tool_calls от Ollama, диспетчеризация,
-формат tool-сообщения.
+Smoke-тесты обращаются к Ollama НАПРЯМУЮ через OLLAMA_HOST —
+гейтвей не задействован. Поэтому клиент инжектится через `client=`,
+минуя `_make_ollama_client`, который требует mTLS-конфиг
+(GATEWAY_CLIENT_CERT/KEY/CA_CERT). В CI эти тесты не гоняются
+(`--ignore=tests/smoke`); локально запускаются на dev-хосте, где
+mTLS-сертификатов может не быть.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ def _require_model():
 
 @pytest.fixture
 def agent(tmp_path: Path) -> HarnessAgent:
+    """HarnessAgent с прямым ollama.Client (без mTLS)."""
     (tmp_path / "notes").mkdir()
     (tmp_path / "hello.txt").write_text("PONG-42\n", encoding="utf-8")
 
@@ -54,13 +58,20 @@ def agent(tmp_path: Path) -> HarnessAgent:
         "blacklist": [],
         "writable": ["notes/**", "*.txt"],
     })
-    return HarnessAgent({
-        "workspace_dir": str(tmp_path),
-        "ollama_host": HOST,
-        "model": MODEL,
-        "api_proxy_url": "",
-        "proxy_secret": "",
-    }, guard)
+    # Прямой клиент к Ollama. Smoke не проверяет mTLS-путь —
+    # для этого нужен gateway-tls, а он в CI/локально недоступен.
+    direct_client = ollama.Client(host=HOST)
+    return HarnessAgent(
+        {
+            "workspace_dir": str(tmp_path),
+            "ollama_host": HOST,
+            "model": MODEL,
+            "api_proxy_url": "",
+            "proxy_secret": "",
+        },
+        guard,
+        client=direct_client,
+    )
 
 
 def test_read_file_via_tool_call(agent: HarnessAgent):
@@ -71,12 +82,9 @@ def test_read_file_via_tool_call(agent: HarnessAgent):
     )
     text = result["text"]
 
-    # Основной успех: модель вызвала инструмент и получила маркер из файла.
     if "PONG-42" in text:
         return
 
-    # Если модель не справилась — фиксируем как xfail, но не падаем:
-    # маленькие tool-capable модели могут быть нестабильны.
     pytest.xfail(
         f"model did not surface tool result. Response: {text[:300]!r}"
     )
@@ -95,9 +103,6 @@ def test_propose_write_via_tool_call(agent: HarnessAgent):
             f"model did not call propose_write. Response: {result['text'][:300]!r}"
         )
 
-    # Модель может вернуть "./notes/smoke.txt" или "notes/smoke.txt".
-    # removeprefix убирает РОВНО префикс, а не набор символов (lstrip здесь
-    # сломал бы пути вида "..notes/x").
     normalized = Path(pending[0]["path"]).as_posix().removeprefix("./")
     assert normalized.startswith("notes/"), (
         f"unexpected path: {pending[0]['path']!r}"

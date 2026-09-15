@@ -8,16 +8,22 @@
 |---|---|---|
 | `workspace/` | Ваши данные и результаты | По важности данных |
 | `config/fs_policy.yaml` | Политики доступа | После каждой правки |
+| `config/gateway_clients.yaml` | Токены и профили клиентов гейтвея | После изменения |
 | `.env` | Секреты, UID/GID, имя модели | После изменения |
 | `uv.lock`, `pyproject.toml` | Воспроизводимость окружения | При обновлении зависимостей |
 | `ollama-models-verified.sha256` | Манифест модели | После `sync-model.sh` |
-| `logs/audit.jsonl` | История операций | Опционально, для форензики |
+| `logs/audit.jsonl`, `logs/gateway.jsonl` | История операций | Опционально, для форензики |
+
+**`certs/` в бэкап не входит.** CA и клиентские сертификаты
+восстанавливаются заново (`gateway-certs.sh`); `ca.key` хранится
+отдельно в offline-хранилище.
 
 ## Что **не** бэкапить
 
 - `ollama-models-verified` — восстанавливается через `sync-model.sh`.
 - `ollama-models-staging` — временный том updater'а.
 - `__pycache__`, `.pytest_cache` — кэши.
+- `certs/` — генерируется `gateway-certs.sh`.
 
 ## Бэкап
 
@@ -41,24 +47,28 @@ tar czf ~/harness-backup-$(date +%F).tgz \
 source ~/.bashrc
 
 # 2. Развернуть файлы проекта
-./setup.sh
-cd harness-project
+git clone https://github.com/walking-in-the-woods/paranoid-harness.git
+cd paranoid-harness
 
 # 3. Распаковать бэкап
 tar xzf ~/harness-backup-2026-09-11.tgz
 
 # 4. Bootstrap
-./bootstrap.sh
+./scripts/bootstrap.sh
 ```
 
-## Ротация `audit.jsonl`
+## Ротация audit-логов
+
+Ротируются два файла: `logs/audit.jsonl` (harness) и
+`logs/gateway.jsonl` (model-gateway).
 
 **Ручная ротация:**
 
 ```bash
 cd harness-project/logs
 mv audit.jsonl audit-$(date +%F).jsonl
-gzip audit-*.jsonl
+mv gateway.jsonl gateway-$(date +%F).jsonl
+gzip *.jsonl
 ```
 
 **Автоматическая ротация через `logrotate`:**
@@ -72,16 +82,22 @@ sed "s|@PROJECT_PATH@|$(pwd)|; s|@UID@|$(id -u)|; s|@GID@|$(id -g)|" \
 sudo logrotate -d /etc/logrotate.d/harness
 ```
 
-**Почему `copytruncate`:** `AuditLog` пишет через `open(..., "a")`,
-не удерживая файловый дескриптор между вызовами.
+**Почему `copytruncate` для audit.jsonl:** `AuditLog` пишет через
+`open(..., "a")`, не удерживая файловый дескриптор между вызовами.
 
-### Известные ограничения audit-лога
+**Почему `create` без `copytruncate` для gateway.jsonl:** `AuditWriter`
+открывает файл на каждый `write`, не удерживает дескриптор.
+Ротация без `copytruncate` не теряет данные.
+
+### Известные ограничения audit-логов
 
 - **Пути в логе не редактируются.** `_redact_args` скрывает
   `content`, `body`, `params`. Но `path` остаётся как есть.
-- **`fsync` только для критичных событий.** `apply_result`,
-  `session_start`, `session_end`, `propose_write`,
-  `user_prompt_blocked`, `ollama_error` пишутся с `fsync`.
+- **`fsync` только для критичных событий.** В `audit.jsonl`:
+  `apply_result`, `session_start`, `session_end`, `propose_write`,
+  `user_prompt_blocked`, `ollama_error`. В `gateway.jsonl`:
+  `gateway_start`, `gateway_stop`, `request_rejected`, `rate_limited`,
+  `upstream_error`.
 - **Ротация не автоматизирована в compose.** Шаблон в
   `config/logrotate.harness` нужно установить вручную.
 
@@ -89,7 +105,7 @@ sudo logrotate -d /etc/logrotate.d/harness
 
 ```bash
 cd harness-project
-./scripts/sync-model.sh
+bash scripts/sync-model.sh
 ```
 
 Скрипт:
@@ -141,18 +157,45 @@ docker exec ollama-updater ollama list --json | \
 docker pull alpine:3.19
 docker inspect --format='{{index .RepoDigests 0}}' alpine:3.19
 
-ALPINE_IMAGE=alpine@sha256:<digest> ./scripts/sync-model.sh
+ALPINE_IMAGE=alpine@sha256:<digest> bash scripts/sync-model.sh
 ```
 
 ## Смена `PROXY_SECRET`
 
-Секрет читается на импорте модуля — **пересборка обязательна**.
+`PROXY_SECRET` читается контейнерами `api-proxy` и `harness` на
+импорте/старте. `harness` передаёт его в `api-proxy` через заголовок
+`X-Proxy-Secret`. Пересборка `api-proxy` и перезапуск `harness`
+обязательны.
 
 ```bash
 NEW=$(openssl rand -hex 32)
 sed -i "s|^PROXY_SECRET=.*|PROXY_SECRET=$NEW|" .env
 sudo docker compose build api-proxy
 sudo docker compose up -d --force-recreate api-proxy harness
+```
+
+## Смена `GATEWAY_HMAC_KEY`
+
+`GATEWAY_HMAC_KEY` используется `model-gateway` для `prompt_hash` в
+`logs/gateway.jsonl`. Старые записи после смены ключа больше не
+коррелируются по хешу — это ожидаемо. Пересборка не нужна — только
+перезапуск контейнера.
+
+```bash
+sed -i "s|^GATEWAY_HMAC_KEY=.*|GATEWAY_HMAC_KEY=$(openssl rand -hex 32)|" .env
+sudo docker compose up -d --force-recreate model-gateway
+```
+
+## Смена `OLLAMA_IMAGE`
+
+`OLLAMA_IMAGE` в `.env` — образ для `ollama-runner` и
+`ollama-updater`. Для paranoid-режима задайте digest:
+
+```bash
+docker pull ollama/ollama:latest
+docker inspect --format='{{index .RepoDigests 0}}' ollama/ollama:latest
+# OLLAMA_IMAGE=ollama/ollama@sha256:<hex> в .env
+sudo docker compose up -d --force-recreate ollama-runner
 ```
 
 ## Обновление зависимостей Python
@@ -182,7 +225,7 @@ diff <(cat старый-setup.sh) <(cat новый-setup.sh)
 
 ```bash
 sudo docker compose logs --since 1h | grep -i error
-du -h logs/audit.jsonl
+du -h logs/audit.jsonl logs/gateway.jsonl
 df -h .
 sudo docker compose exec ollama-runner ollama list
 ```
@@ -194,6 +237,15 @@ jq -r 'select(.event=="propose_write") | .path' logs/audit.jsonl | sort | uniq -
 jq 'select(.event=="user_prompt_blocked")' logs/audit.jsonl
 ```
 
+**Anomaly-детекция на gateway-логе:**
+
+```bash
+jq -r 'select(.event=="request") | .client' logs/gateway.jsonl | sort | uniq -c
+jq 'select(.event=="rate_limited")' logs/gateway.jsonl
+jq 'select(.event=="auth_fail")' logs/gateway.jsonl
+jq 'select(.event=="response" and .duration_ms > 30000)' logs/gateway.jsonl
+```
+
 ## Восстановление после сбоя
 
 **Харнесс не стартует:**
@@ -203,19 +255,40 @@ sudo docker compose logs harness
 sudo docker compose config
 ```
 
+**Model-gateway не стартует:**
+
+```bash
+sudo docker compose logs model-gateway
+# Частая причина: пустой или неполный config/gateway_clients.yaml
+# или отсутствие /certs/ca.crt. Проверьте:
+ls -la certs/
+grep -c "token_sha256" config/gateway_clients.yaml
+```
+
+**Gateway-tls не стартует:**
+
+```bash
+sudo docker compose logs gateway-tls
+# Частая причина: /certs/server.key не смонтирован или права 0600
+# без root у master. Проверьте:
+ls -la certs/server.key
+```
+
 **Модель не загружается:**
 
 ```bash
 sudo docker compose exec ollama-runner ollama list
-./scripts/sync-model.sh qwen3:8b
+bash scripts/sync-model.sh qwen3:8b
 ```
 
 **Потерян `.env`:**
 
 ```bash
 cp .env.example .env
-# вписать PROXY_SECRET (тот же, что был — иначе пересобрать api-proxy)
+# вписать PROXY_SECRET, GATEWAY_HMAC_KEY (те же, что были — иначе
+# пересобрать api-proxy и перезапустить model-gateway)
 # вписать UID, GID
+# вписать HARNESS_GATEWAY_TOKEN, WEBUI_GATEWAY_TOKEN
 ```
 
 **Потерян `uv.lock`:**
@@ -228,7 +301,7 @@ uv sync --locked
 
 ## Что делать перед длительным простоем
 
-1. Сохранить бэкап `workspace/` и `.env`.
+1. Сохранить бэкап `workspace/`, `config/`, `.env`.
 2. Зафиксировать версию модели.
 3. Остановить контейнеры (не удалять volume):
    ```bash
@@ -241,7 +314,7 @@ uv sync --locked
    ```bash
    sudo docker compose down
    ```
-2. Сохранить `logs/audit.jsonl` для анализа.
+2. Сохранить `logs/audit.jsonl` и `logs/gateway.jsonl` для анализа.
 3. Проверить `workspace/output/` и `workspace/notes/`.
 4. Проверить целостность моделей:
    ```bash
@@ -253,5 +326,57 @@ uv sync --locked
    ```bash
    git diff uv.lock
    ```
-6. Пересоздать окружение с чистого `setup.sh`, восстановить только
-   `workspace/` и `config/`.
+6. Если подозревается компрометация CA:
+   - `sudo docker compose stop model-gateway gateway-tls`
+   - удалить `certs/ca.*`
+   - перегенерировать: `bash scripts/gateway-certs.sh certs harness webui`
+   - ротировать токены: очистить `token_sha256` в YAML и в `.env`,
+     запустить `bash scripts/bootstrap.sh`
+   - `sudo docker compose up -d`
+7. Пересоздать окружение с чистого клона, восстановить только
+   `workspace/`, `config/`, `.env`.
+
+## Требования к инструментам
+
+* `openssl` ≥ 1.1.1 (`-addext` в `req -x509`, SAN в x509 v3).
+  Ubuntu 20.04+, Debian 11+, macOS 11+ подходят.
+* GNU sed ≥ 4.2 (`sed -i --follow-symlinks` в `pin-images.sh`).
+  macOS не поддерживается.
+* bash ≥ 4.4 (guard на пустой ассоциативный массив в
+  `verify-project.sh`).
+* Python ≥ 3.10 (`requires-python = ">=3.12"` в `model_gateway`;
+  unit-тесты работают на 3.10+).
+* `python3` — только для опциональной digest-верификации модели.
+
+## CI: strict-режим для release-ветки
+
+Шаг `Check image pinning` в CI:
+
+* **Всегда** (включая dev): error на `REPLACE_WITH_PINNED_DIGEST`
+  и на `:latest`.
+* **Warning** (dev): теги без digest.
+
+Для release-ветки (`main`/`release-*`) `--strict` переводит
+warning в error.
+
+## Проверка SAN в выпущенных сертификатах
+
+```bash
+openssl x509 -in certs/harness.crt -noout -ext subjectAltName
+# X509v3 Subject Alternative Name: critical
+#     DNS:harness
+```
+
+Если SAN отсутствует или CN ≠ SAN — сертификат не пройдёт
+верификацию в гейтвее. Перегенерируйте через
+`bash scripts/gateway-certs.sh`.
+
+## Проверка server.crt перед деплоем
+
+```bash
+openssl x509 -in certs/server.crt -noout -text \
+  | grep -E "Subject Alternative Name|Extended Key Usage" -A1
+```
+
+Гейтвей при старте проверяет: expiry, EKU=serverAuth, SAN содержит
+`gateway-tls`. Несоответствие → отказ старта.

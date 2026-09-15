@@ -20,6 +20,15 @@ sha256-манифесту.
 локальный порт 8080, требует `X-Proxy-Secret`, использует фиксированный
 словарь маршрутов.
 
+**model-gateway** — FastAPI-гейтвей к Ollama. Единственный, кто
+видит `ollama-runner`. Аутентифицирует клиентов (mTLS + токен),
+применяет профиль (tools, system prompt, rate limit), пишет
+`gateway.jsonl`.
+
+**gateway-tls** — nginx с TLS-терминацией. Обязательный клиентский
+сертификат (`ssl_verify_client on`). Пробрасывает сертификат в
+`X-Client-Cert`, статус верификации — в `X-Client-Verify`.
+
 ## Сети и безопасность
 
 **`internal-net`** — Docker-сеть с флагом `internal: true`. Означает,
@@ -35,6 +44,17 @@ iptables. Модель в такой сети физически не может
 
 **`X-Proxy-Secret`** — HTTP-заголовок с секретом, которым `harness`
 аутентифицируется в `api-proxy`. Без него прокси возвращает 403.
+
+**`X-Gateway-Token`** — токен клиента, которым клиент
+аутентифицируется в `model-gateway`. Второй фактор после mTLS.
+
+**`X-Client-Cert`** — URL-encoded PEM клиентского сертификата,
+пробрасываемый nginx. Python верифицирует подпись через `cryptography`.
+
+**`X-Client-Verify`** — статус верификации клиентского сертификата
+в nginx. Значение `SUCCESS` подтверждает, что TLS-handshake прошёл с
+валидным клиентским сертификатом. `model-gateway` проверяет это
+значение как defense-in-depth до верификации подписи в Python.
 
 **Read-after-write block** — правило: файл, помеченный как записанный
 в текущей сессии, нельзя прочитать в той же сессии. Защита от
@@ -68,6 +88,13 @@ whitelist. По умолчанию: `.env`, `.git/**`, `.ssh/**`, `*.key`,
 **`--verify-sha256=<hash>`** — флаг `bootstrap.sh`. Опциональная
 автоматическая проверка SHA256 `setup.sh`. Формат: 64 hex-символа
 в нижнем регистре, без префикса `sha256:`.
+
+**`GATEWAY_HMAC_KEY`** — HMAC-ключ `model-gateway` для `prompt_hash`
+в `gateway.jsonl`. Должен быть ≥32 символов.
+
+**`prompt_hash`** — HMAC-SHA256 с length-prefix от потока
+`(role, content)` всех сообщений. Содержимое промптов не логируется;
+хеш позволяет находить дубли и replay независимо от модели.
 
 ## Формат данных
 
@@ -121,6 +148,10 @@ fork bomb, `eval(`, `subprocess.`).
 **`canonical_rel`** — метод `HarnessAgent`, возвращающий
 канонический posix-путь относительно workspace.
 
+**mTLS** — mutual TLS. Клиент предъявляет сертификат, подписанный CA
+проекта; nginx проверяет его при handshake, `model-gateway`
+верифицирует подпись в Python.
+
 ## Файлы
 
 **`pyproject.toml`** — описание Python-проекта. Зависимости проекта
@@ -132,12 +163,20 @@ fork bomb, `eval(`, `subprocess.`).
 **`fs_policy.yaml`** — политики доступа к файлам: whitelist,
 blacklist, writable.
 
-**`audit.jsonl`** — JSONL-лог событий. Пишется вне `workspace/`.
-Для критичных событий — с `fsync`, для информационных — только
-`flush`. **Известное ограничение:** `path` не редактируется.
+**`gateway_clients.yaml`** — профили клиентов гейтвея: `name`,
+`token_sha256`, `tools_enabled`, `allowed_tools`,
+`forced_system_prompt`, `requests_per_minute`, `max_concurrent`,
+`allow_stream`.
+
+**`audit.jsonl`** — JSONL-лог событий `harness`. Пишется вне
+`workspace/`. Для критичных событий — с `fsync`, для информационных —
+только `flush`. **Известное ограничение:** `path` не редактируется.
+
+**`gateway.jsonl`** — JSONL-лог событий `model-gateway`. Ни промптов,
+ни ответов; метаданные, IP, HMAC-хеш.
 
 **`ollama-models-verified.sha256`** — манифест sha256 снапшота
 модели, посчитанный при промоушене в runner-volume.
 
 **`config/logrotate.harness`** — шаблон конфига logrotate для
-ротации `logs/audit.jsonl`.
+ротации `logs/audit.jsonl` и `logs/gateway.jsonl`.
